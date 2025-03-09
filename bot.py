@@ -8,7 +8,55 @@ import requests
 import asyncio
 import datetime
 import traceback
+import threading
 from typing import Dict, Optional, List, Union, Literal
+from flask import Flask, render_template_string
+
+# 创建Flask应用
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    # 返回一个简单的HTML页面
+    return render_template_string("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>NovelAI Discord Bot</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                max-width: 800px;
+                margin: 0 auto;
+                padding: 20px;
+                text-align: center;
+            }
+            .container {
+                background-color: #f5f5f5;
+                border-radius: 8px;
+                padding: 20px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            h1 {
+                color: #7289DA;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>NovelAI Discord Bot</h1>
+            <p>Bot is running! This page helps keep the bot active on Glitch.</p>
+            <p>To add the bot to your server, use the Discord Developer Portal.</p>
+            <p>Current Status: ✅ Online</p>
+        </div>
+    </body>
+    </html>
+    """)
+
+# 启动Flask网页服务器
+def run_flask():
+    # 设置主机为0.0.0.0以允许外部访问
+    app.run(host='0.0.0.0', port=3000)
 
 # Discord机器人设置
 intents = discord.Intents.default()
@@ -28,7 +76,7 @@ DEFAULT_SIZE = (832, 1216)  # (width, height)
 DEFAULT_STEPS = 28
 DEFAULT_SCALE = 6.5
 DEFAULT_SAMPLER = "k_euler_ancestral"
-DEFAULT_NOISE_SCHEDULE = karras"
+DEFAULT_NOISE_SCHEDULE = "native"
 DEFAULT_CFG_RESCALE = 0.1
 DEFAULT_NEG_PROMPT = "lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands"
 
@@ -794,12 +842,18 @@ def get_noise_schedule_description(schedule):
     }
     return descriptions.get(schedule, "")
 
-# 运行机器人
+# 主函数
 if __name__ == "__main__":
     # 从环境变量获取令牌
     TOKEN = os.getenv("DISCORD_TOKEN")
     if not TOKEN:
         print("错误: 未设置DISCORD_TOKEN环境变量")
         exit(1)
-        
+    
+    # 在一个新线程中启动Flask网页服务器
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.daemon = True  # 设置为守护线程，这样当主程序退出时，这个线程也会退出
+    flask_thread.start()
+    
+    # 运行Discord机器人
     client.run(TOKEN)
