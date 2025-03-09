@@ -28,7 +28,7 @@ DEFAULT_SIZE = (832, 1216)  # (width, height)
 DEFAULT_STEPS = 28
 DEFAULT_SCALE = 6.5
 DEFAULT_SAMPLER = "k_euler_ancestral"
-DEFAULT_NOISE_SCHEDULE = "native"
+DEFAULT_NOISE_SCHEDULE = karras"
 DEFAULT_CFG_RESCALE = 0.1
 DEFAULT_NEG_PROMPT = "lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands"
 
