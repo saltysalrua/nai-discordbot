@@ -1,0 +1,17 @@
+{
+  "install": {
+    "include": [
+      "^requirements\\.txt$"
+    ],
+    "exclude": []
+  },
+  "restart": {
+    "include": [
+      "^bot\\.py$"
+    ],
+    "exclude": [
+      "^.env$"
+    ]
+  },
+  "throttle": 1000
+}

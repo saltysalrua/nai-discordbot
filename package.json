@@ -1,0 +1,30 @@
+{
+  "name": "novelai-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for generating images with NovelAI API",
+  "main": "bot.py",
+  "scripts": {
+    "start": "bash start.sh"
+  },
+  "engines": {
+    "node": "14.x"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saltysalrua/nai-discordbot.git"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "novelai",
+    "ai",
+    "image",
+    "generator"
+  ],
+  "author": "salty",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/saltysalrua/nai-discordbot/issue"
+  },
+  "homepage": "https://github.com/saltysalrua/nai-discordbot#readme"
+}
