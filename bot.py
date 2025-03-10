@@ -14,6 +14,42 @@ import aiohttp
 from typing import Dict, Optional, List, Union, Literal, Tuple
 from flask import Flask, render_template_string
 
+# 读取配置文件函数
+def read_config_file(file_path="config.txt"):
+    config = {}
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            for line in file:
+                # 忽略注释和空行
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                
+                # 解析键值对
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    config[key.strip()] = value.strip()
+    except Exception as e:
+        print(f"读取配置文件时出错: {str(e)}")
+    return config
+
+# 读取配置
+config = read_config_file()
+
+# 从配置文件加载设置，如果找不到则使用默认值
+DISCORD_TOKEN = config.get('DISCORD_TOKEN')
+DEFAULT_MODEL = config.get('DEFAULT_MODEL', 'nai-diffusion-3')
+DEFAULT_SIZE = (
+    int(config.get('DEFAULT_SIZE_WIDTH', '832')), 
+    int(config.get('DEFAULT_SIZE_HEIGHT', '1216'))
+)
+DEFAULT_STEPS = int(config.get('DEFAULT_STEPS', '28'))
+DEFAULT_SCALE = float(config.get('DEFAULT_SCALE', '6.5'))
+DEFAULT_SAMPLER = config.get('DEFAULT_SAMPLER', 'k_euler_ancestral')
+DEFAULT_NOISE_SCHEDULE = config.get('DEFAULT_NOISE_SCHEDULE', 'native')
+DEFAULT_CFG_RESCALE = float(config.get('DEFAULT_CFG_RESCALE', '0.1'))
+DEFAULT_NEG_PROMPT = config.get('DEFAULT_NEG_PROMPT', 'lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands')
+
 # 创建Flask应用
 app = Flask(__name__)
 
@@ -71,16 +107,6 @@ NAI_API_URL = "https://image.novelai.net/ai/generate-image"
 # 用户API密钥存储
 # 结构: {user_id: {"key": api_key, "shared_guilds": [guild_ids], "expires_at": datetime, "provider_name": "用户名"}}
 api_keys = {}
-
-# 默认参数
-DEFAULT_MODEL = "nai-diffusion-3"  # 更改为v3模型作为默认，因为更稳定
-DEFAULT_SIZE = (832, 1216)  # (width, height)
-DEFAULT_STEPS = 28
-DEFAULT_SCALE = 6.5
-DEFAULT_SAMPLER = "k_euler_ancestral"
-DEFAULT_NOISE_SCHEDULE = "native"
-DEFAULT_CFG_RESCALE = 0.1
-DEFAULT_NEG_PROMPT = "lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands"
 
 # 可用的选项
 AVAILABLE_MODELS = [
@@ -140,6 +166,7 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
     
     # 优化参数设置
     model = payload.get("model", "")
+    input_prompt = payload.get("input", "")
     parameters = payload.get("parameters", {})
     optimized_parameters = parameters.copy()
     
@@ -152,6 +179,34 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
         # v4特定参数
         optimized_parameters["params_version"] = 3  # v4需要此参数
         optimized_parameters["use_coords"] = True  # 使用坐标系统
+        
+        # v4格式化提示词和负面提示词
+        negative_prompt = optimized_parameters.get("negative_prompt", "")
+        
+        # 构建v4提示词结构
+        v4_prompt = {
+            "caption": {
+                "base_caption": input_prompt,
+                "char_captions": []  # 基本用法中没有角色提示词
+            },
+            "use_coords": True,
+            "use_order": True
+        }
+        
+        # 构建v4负面提示词结构
+        v4_negative_prompt = {
+            "caption": {
+                "base_caption": negative_prompt,
+                "char_captions": []  # 基本用法中没有角色负面提示词
+            },
+            "use_coords": True,
+            "use_order": True
+        }
+        
+        # 将这些添加到参数中
+        optimized_parameters["v4_prompt"] = v4_prompt
+        optimized_parameters["v4_negative_prompt"] = v4_negative_prompt
+        
         # v4不需要这些参数
         for key in ["dynamic_thresholding", "deliberate_euler_ancestral_bug", "prefer_brownian"]:
             if key in optimized_parameters:
@@ -243,6 +298,25 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
                 if model.startswith("nai-diffusion-4"):
                     safe_params["params_version"] = 3
                     safe_params["use_coords"] = True
+                    
+                    # 添加v4提示词结构
+                    safe_params["v4_prompt"] = {
+                        "caption": {
+                            "base_caption": input_prompt,
+                            "char_captions": []
+                        },
+                        "use_coords": True,
+                        "use_order": True
+                    }
+                    
+                    safe_params["v4_negative_prompt"] = {
+                        "caption": {
+                            "base_caption": parameters.get("negative_prompt", DEFAULT_NEG_PROMPT),
+                            "char_captions": []
+                        },
+                        "use_coords": True,
+                        "use_order": True
+                    }
                     
                     # 如果仍然是v4模型，建议用户尝试v3
                     await interaction.followup.send(
@@ -1409,11 +1483,17 @@ def get_noise_schedule_description(schedule, is_v4=False):
 
 # 主函数
 if __name__ == "__main__":
-    # 从环境变量获取令牌
-    TOKEN = os.getenv("DISCORD_TOKEN")
+    # 使用配置文件中的令牌，如果没有则尝试从环境变量获取
+    TOKEN = DISCORD_TOKEN or os.getenv("DISCORD_TOKEN")
     if not TOKEN:
-        print("错误: 未设置DISCORD_TOKEN环境变量")
+        print("错误: 未设置DISCORD_TOKEN，请在config.txt文件或环境变量中配置")
         exit(1)
+    
+    # 显示已加载的配置
+    print(f"已加载配置:")
+    print(f"- 默认模型: {DEFAULT_MODEL}")
+    print(f"- 默认尺寸: {DEFAULT_SIZE}")
+    print(f"- 默认步数: {DEFAULT_STEPS}")
     
     # 在一个新线程中启动Flask网页服务器
     flask_thread = threading.Thread(target=run_flask)

@@ -1,0 +1,16 @@
+# Discord机器人配置示例文件
+# 复制此文件为config.txt并填入你的实际参数
+
+# 必填参数
+DISCORD_TOKEN=你的discord机器人token
+
+# 可选参数（使用默认值可不修改）
+DEFAULT_MODEL=nai-diffusion-3
+DEFAULT_SIZE_WIDTH=832
+DEFAULT_SIZE_HEIGHT=1216
+DEFAULT_STEPS=28
+DEFAULT_SCALE=6.5
+DEFAULT_SAMPLER=k_euler_ancestral
+DEFAULT_NOISE_SCHEDULE=native
+DEFAULT_CFG_RESCALE=0.1
+DEFAULT_NEG_PROMPT=lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts
