@@ -32,6 +32,14 @@ else
   echo "已找到config.txt配置文件"
 fi
 
+# 检查API密钥文件权限
+if [ -f "api_keys.json" ]; then
+  echo "发现API密钥存储文件"
+  # 设置文件权限为仅所有者可读写
+  chmod 600 api_keys.json
+  echo "已设置api_keys.json为仅所有者可读写(权限600)"
+fi
+
 # 显示已安装的包
 echo "已安装的Python包:"
 python3 -m pip list
