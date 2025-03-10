@@ -5,12 +5,12 @@
 DISCORD_TOKEN=你的discord机器人token
 
 # 可选参数（使用默认值可不修改）
-DEFAULT_MODEL=nai-diffusion-3
+DEFAULT_MODEL=nai-diffusion-4-full
 DEFAULT_SIZE_WIDTH=832
 DEFAULT_SIZE_HEIGHT=1216
 DEFAULT_STEPS=28
-DEFAULT_SCALE=6.5
+DEFAULT_SCALE=6
 DEFAULT_SAMPLER=k_euler_ancestral
-DEFAULT_NOISE_SCHEDULE=native
+DEFAULT_NOISE_SCHEDULE=karras
 DEFAULT_CFG_RESCALE=0.1
-DEFAULT_NEG_PROMPT=lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts
+DEFAULT_NEG_PROMPT=lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts,blank page,
