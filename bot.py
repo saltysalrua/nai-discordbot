@@ -9,17 +9,32 @@ import asyncio
 import datetime
 import traceback
 import random
-from typing import Dict, Optional, List, Union, Literal
+import time
+import copy
+import shutil
+import sys
+from typing import Dict, Optional, List, Union, Literal, Tuple, Any
 
-# 全局变量，记录每个密钥的使用情况
+# ===== 全局变量 =====
+# API密钥和模板存储
+api_keys = {}
+prompt_templates = {}
+# 使用跟踪
 key_usage_counter = {}
 key_last_used = {}
+# 图像历史和生成队列
+recent_generations = {}
+generation_queues = {}
+# 协作会话
+relay_sessions = {}
 
-# 记录机器人启动时间的全局变量
+# 记录机器人启动时间和版本
 BOT_START_TIME = datetime.datetime.now()
+VERSION = "2.0.0"
 
-# 读取配置文件函数
+# ===== 配置管理 =====
 def read_config_file(file_path="config.txt"):
+    """读取配置文件"""
     config = {}
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
@@ -38,7 +53,7 @@ def read_config_file(file_path="config.txt"):
 # 读取配置
 config = read_config_file()
 
-# 从配置文件加载设置，如果找不到则使用默认值
+# 从配置文件加载设置
 DISCORD_TOKEN = config.get('DISCORD_TOKEN') or os.getenv("DISCORD_TOKEN")
 DEFAULT_MODEL = config.get('DEFAULT_MODEL', 'nai-diffusion-3')
 DEFAULT_SIZE = (
@@ -51,6 +66,8 @@ DEFAULT_SAMPLER = config.get('DEFAULT_SAMPLER', 'k_euler_ancestral')
 DEFAULT_NOISE_SCHEDULE = config.get('DEFAULT_NOISE_SCHEDULE', 'native')
 DEFAULT_CFG_RESCALE = float(config.get('DEFAULT_CFG_RESCALE', '0.1'))
 DEFAULT_NEG_PROMPT = config.get('DEFAULT_NEG_PROMPT', 'lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands')
+BOT_ADMIN_IDS = config.get('BOT_ADMIN_IDS', "").split(",")
+GITHUB_REPO = config.get('GITHUB_REPO', '')
 
 # Discord机器人设置
 intents = discord.Intents.default()
@@ -59,10 +76,6 @@ tree = app_commands.CommandTree(client)
 
 # NovelAI API设置
 NAI_API_URL = "https://image.novelai.net/ai/generate-image"
-
-# 用户API密钥存储
-# 结构: {user_id: {"key": api_key, "shared_guilds": [guild_ids], "expires_at": datetime, "provider_name": "用户名", "persist": bool}}
-api_keys = {}
 
 # 可用的选项
 AVAILABLE_MODELS = [
@@ -118,7 +131,49 @@ AVAILABLE_NOISE_SCHEDULES_V4 = [
     "polyexponential",
 ]
 
-# 保存API密钥到文件
+# ===== 文件存储功能 =====
+def save_data_to_file(data, filename, key_field="expires_at"):
+    """通用数据保存函数"""
+    if not data:
+        return
+        
+    # 处理日期字段序列化
+    serializable_dict = {}
+    for item_id, item_data in data.items():
+        serializable_data = item_data.copy()
+        if key_field in serializable_data and serializable_data[key_field]:
+            if isinstance(serializable_data[key_field], datetime.datetime):
+                serializable_data[key_field] = serializable_data[key_field].isoformat()
+        serializable_dict[item_id] = serializable_data
+    
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(serializable_dict, f, ensure_ascii=False, indent=2)
+        print(f"已保存 {len(data)} 条数据到 {filename}")
+    except Exception as e:
+        print(f"保存数据到 {filename} 时出错: {str(e)}")
+
+def load_data_from_file(filename, key_field="expires_at"):
+    """通用数据加载函数"""
+    if not os.path.exists(filename):
+        print(f"未找到文件: {filename}")
+        return {}
+    
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        
+        # 将字符串日期转换回datetime对象
+        for item_id, item_data in data.items():
+            if key_field in item_data and item_data[key_field]:
+                item_data[key_field] = datetime.datetime.fromisoformat(item_data[key_field])
+        
+        print(f"已成功加载 {len(data)} 条数据从 {filename}")
+        return data
+    except Exception as e:
+        print(f"加载数据从 {filename} 时出错: {str(e)}")
+        return {}
+
 def save_api_keys_to_file():
     """将标记为持久化的API密钥保存到文件"""
     # 只保存标记为持久化的密钥
@@ -127,74 +182,21 @@ def save_api_keys_to_file():
         for user_id, data in api_keys.items() 
         if data.get("persist", False)
     }
-    
-    # 如果没有需要保存的密钥，则不进行任何操作
-    if not keys_to_save:
-        return
-    
-    # 准备用于序列化的数据
-    serializable_dict = {}
-    for user_id, data in keys_to_save.items():
-        serializable_data = data.copy()
-        # 处理datetime对象
-        if "expires_at" in serializable_data and serializable_data["expires_at"]:
-            serializable_data["expires_at"] = serializable_data["expires_at"].isoformat()
-        serializable_dict[user_id] = serializable_data
-    
-    try:
-        # 保存数据到JSON文件
-        with open("api_keys.json", "w", encoding="utf-8") as f:
-            json.dump(serializable_dict, f, ensure_ascii=False, indent=2)
-        
-        print(f"已保存 {len(keys_to_save)} 个API密钥")
-    except Exception as e:
-        print(f"保存API密钥时出错: {str(e)}")
+    save_data_to_file(keys_to_save, "api_keys.json")
 
-# 从文件加载API密钥
 def load_api_keys_from_file():
     """从文件加载API密钥"""
-    if not os.path.exists("api_keys.json"):
-        print("未找到API密钥文件")
-        return {}
-    
-    try:
-        # 读取JSON数据
-        with open("api_keys.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # 将字符串日期转换回datetime对象
-        import datetime
-        for user_id, key_data in data.items():
-            if "expires_at" in key_data and key_data["expires_at"]:
-                key_data["expires_at"] = datetime.datetime.fromisoformat(key_data["expires_at"])
-        
-        print(f"已成功加载 {len(data)} 个API密钥")
-        return data
-    
-    except Exception as e:
-        print(f"加载API密钥时出错: {str(e)}")
-        return {}
+    return load_data_from_file("api_keys.json")
 
-@client.event
-async def on_ready():
-    print(f'机器人已登录为 {client.user}')
-    await tree.sync()  # 同步斜杠命令
-    
-    # 从文件加载API密钥
-    global api_keys
-    loaded_keys = load_api_keys_from_file()
-    if loaded_keys:
-        api_keys.update(loaded_keys)
-        print(f"已从文件加载 {len(loaded_keys)} 个API密钥")
-    
-    # 启动密钥过期检查任务
-    client.loop.create_task(check_expired_keys())
-    # 启动定期保存任务
-    client.loop.create_task(periodic_save_keys())
-    # 启动每小时密钥验证任务
-    client.loop.create_task(hourly_validate_keys())
+def save_templates_to_file():
+    """将提示词模板保存到文件"""
+    save_data_to_file(prompt_templates, "prompt_templates.json", key_field="created_at")
 
-# 改进的API请求处理函数
+def load_templates_from_file():
+    """从文件加载提示词模板"""
+    return load_data_from_file("prompt_templates.json", key_field="created_at")
+
+# ===== API请求处理 =====
 async def send_novelai_request(api_key, payload, interaction, retry_count=0):
     """使用改进的错误处理逻辑发送NovelAI API请求"""
     max_retries = 1
@@ -376,7 +378,26 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
                     return None
                     
                 image_data = zip_file.read("image_0.png")
+                
+                # 添加生成历史记录
+                user_id = str(interaction.user.id)
+                if user_id not in recent_generations:
+                    recent_generations[user_id] = []
+                    
+                # 创建生成记录
+                generation_record = {
+                    "timestamp": datetime.datetime.now(),
+                    "payload": payload.copy(),  # 复制payload避免引用问题
+                    "seed": optimized_parameters.get("seed", "随机")
+                }
+                
+                # 限制每用户最多保存5条记录
+                recent_generations[user_id].insert(0, generation_record)
+                if len(recent_generations[user_id]) > 5:
+                    recent_generations[user_id].pop()
+                
                 return image_data
+                
         except zipfile.BadZipFile:
             # 如果ZIP解析失败，尝试直接将响应作为图像处理
             if len(response_content) > 8 and response_content[:8] == b'\x89PNG\r\n\x1a\n':
@@ -388,6 +409,7 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
             
             await interaction.followup.send("❌ 无法解析NovelAI API响应: 返回的既不是有效的ZIP文件也不是图像")
             return None
+            
     except requests.exceptions.RequestException as e:
         # 网络请求异常
         await interaction.followup.send(f"❌ 连接NovelAI API失败: {str(e)}")
@@ -432,6 +454,7 @@ def get_model_default_params(model):
     
     return params
 
+# ===== 辅助功能 =====
 # 获取当前服务器中的API密钥共享数量
 def get_guild_shared_keys_info(guild_id):
     """获取当前服务器中的API密钥共享信息"""
@@ -450,318 +473,6 @@ def get_guild_shared_keys_info(guild_id):
             })
     
     return shared_keys
-
-# 定期保存任务
-async def periodic_save_keys():
-    """定期保存标记为持久化的API密钥"""
-    while True:
-        await asyncio.sleep(60 * 15)  # 每15分钟保存一次
-        save_api_keys_to_file()
-
-# 检查API密钥有效性
-async def check_api_key_validity(api_key):
-    """检查API密钥是否有效"""
-    test_payload = {
-        "input": "test",
-        "model": "nai-diffusion-3",
-        "action": "generate",
-        "parameters": {
-            "width": 64,  # 使用最小尺寸
-            "height": 64,
-            "scale": 1.0,
-            "sampler": "k_euler",
-            "steps": 1,  # 使用最小步数减少服务器负担
-            "n_samples": 1,
-            "qualityToggle": False
-        }
-    }
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Referer": "https://novelai.net",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
-    }
-    
-    try:
-        response = await client.loop.run_in_executor(
-            None, 
-            lambda: requests.post(
-                NAI_API_URL,
-                headers=headers,
-                json=test_payload,
-                timeout=10
-            )
-        )
-        
-        # 检查响应状态码
-        if response.status_code in (401, 402):
-            return False
-        return True
-    except:
-        # 连接错误也视为可能无效
-        return False
-
-# 每小时检查密钥有效性
-async def hourly_validate_keys():
-    """每小时检查API密钥有效性"""
-    while True:
-        await asyncio.sleep(3600)  # 每小时检查一次
-        print(f"[{datetime.datetime.now()}] 开始执行API密钥有效性检查...")
-        
-        invalid_keys = []
-        checked_count = 0
-        
-        for user_id, key_data in list(api_keys.items()):
-            # 先检查是否已过期
-            if "expires_at" in key_data and key_data["expires_at"] and key_data["expires_at"] < datetime.datetime.now():
-                print(f"密钥已过期: {user_id}")
-                invalid_keys.append(user_id)
-                continue
-            
-            # 检查API密钥有效性
-            is_valid = await check_api_key_validity(key_data["key"])
-            checked_count += 1
-            
-            if not is_valid:
-                print(f"密钥无效: {user_id}")
-                invalid_keys.append(user_id)
-            
-            # 每检查几个密钥暂停一下，避免过快请求
-            if checked_count % 5 == 0:
-                await asyncio.sleep(2)
-        
-        # 移除无效密钥
-        for user_id in invalid_keys:
-            del api_keys[user_id]
-        
-        # 如果有删除持久化密钥，保存更新
-        if any(user_id in api_keys and api_keys[user_id].get("persist", False) for user_id in invalid_keys):
-            save_api_keys_to_file()
-        
-        print(f"[{datetime.datetime.now()}] API密钥检查完成，检查了 {checked_count} 个密钥，移除了 {len(invalid_keys)} 个无效密钥")
-
-# 密钥管理命令
-@tree.command(name="apikey", description="注册或管理你的NovelAI API密钥")
-@app_commands.describe(
-    key="你的NovelAI API密钥",
-    sharing="设置密钥是否在此服务器共享",
-    duration_hours="密钥有效时间(小时), 0表示永不过期",
-    persist="是否在机器人重启后保存密钥（会进行加密存储）"
-)
-async def apikey_command(
-    interaction: discord.Interaction, 
-    key: str = None,
-    sharing: Literal["私人使用", "服务器共享"] = "私人使用",
-    duration_hours: int = 24,
-    persist: Literal["是", "否"] = "否"
-):
-    user_id = str(interaction.user.id)
-    
-    # 检查是否是查看密钥信息请求
-    if key is None:
-        if user_id in api_keys:
-            user_key = api_keys[user_id]
-            
-            # 检查密钥是否已过期
-            if "expires_at" in user_key and user_key["expires_at"] is not None and user_key["expires_at"] < datetime.datetime.now():
-                await interaction.response.send_message("你的API密钥已过期，请重新注册。", ephemeral=True)
-                del api_keys[user_id]
-                return
-            
-            # 构建密钥信息
-            expiry = "永不过期" if "expires_at" not in user_key or user_key["expires_at"] is None else f"{user_key['expires_at'].strftime('%Y-%m-%d %H:%M:%S')}"
-            
-            # 查看共享信息
-            if not user_key.get("shared_guilds"):
-                sharing_info = "私人使用"
-            else:
-                sharing_info = f"共享的服务器: {len(user_key['shared_guilds'])}个"
-                if interaction.guild_id and interaction.guild_id in user_key.get("shared_guilds", []):
-                    sharing_info += " (包括当前服务器)"
-            
-            # 检查是否是持久化存储
-            persist_info = "是" if user_key.get("persist", False) else "否"
-            
-            await interaction.response.send_message(
-                f"你已注册API密钥:\n"
-                f"• 密钥状态: 有效\n"
-                f"• 共享设置: {sharing_info}\n"
-                f"• 过期时间: {expiry}\n"
-                f"• 持久化存储: {persist_info}", 
-                ephemeral=True
-            )
-        else:
-            # 如果在服务器中，显示当前服务器的共享密钥信息
-            if interaction.guild_id:
-                shared_keys = get_guild_shared_keys_info(interaction.guild_id)
-                shared_info = f"当前服务器有 {len(shared_keys)} 个共享的API密钥。"
-                if shared_keys:
-                    providers = [key_info["provider_name"] for key_info in shared_keys]
-                    shared_info += f" 提供者: {', '.join(providers)}"
-                
-                await interaction.response.send_message(
-                    f"你还没有注册API密钥。请使用 `/apikey [你的密钥] [共享设置] [有效时间]` 来注册。\n\n{shared_info}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    "你还没有注册API密钥。请使用 `/apikey [你的密钥] [共享设置] [有效时间]` 来注册。",
-                    ephemeral=True
-                )
-        return
-    
-    # 验证API密钥格式
-    if not key.startswith("pst-") or len(key) < 15:
-        await interaction.response.send_message(
-            "❌ API密钥格式无效。NovelAI的API密钥应以'pst-'开头并包含足够长度。",
-            ephemeral=True
-        )
-        return
-        
-    # 为用户注册新密钥
-    guild_id = interaction.guild_id if interaction.guild_id and sharing == "服务器共享" else None
-    
-    # 设置过期时间
-    expires_at = None
-    if duration_hours > 0:
-        expires_at = datetime.datetime.now() + datetime.timedelta(hours=duration_hours)
-    
-    # 保存密钥信息
-    api_keys[user_id] = {
-        "key": key,
-        "shared_guilds": [guild_id] if guild_id else [],
-        "expires_at": expires_at,
-        "provider_name": interaction.user.display_name,  # 记录提供者名称
-        "persist": persist == "是"  # 添加是否持久化的标志
-    }
-    
-    # 构建确认信息
-    expiry_text = "永不过期" if expires_at is None else f"{duration_hours}小时后过期 ({expires_at.strftime('%Y-%m-%d %H:%M:%S')})"
-    sharing_text = "仅限你个人使用" if not guild_id else f"在此服务器共享使用"
-    
-    # 如果用户选择了持久化存储
-    if persist == "是":
-        # 告知用户关于存储的信息
-        storage_info = (
-            "⚠️ **关于密钥存储的重要信息**\n"
-            "• 你的API密钥将被存储在机器人所在的服务器上（注意：不进行加密）\n"
-            "• 这样在机器人重启后你的密钥设置仍然有效\n"
-            "• 你可以随时使用`/deletekey`命令删除你的密钥\n"
-            "• 密钥仍会按照设定的有效期自动失效"
-        )
-        
-        # 保存密钥数据
-        save_api_keys_to_file()
-        
-        await interaction.response.send_message(
-            f"✅ API密钥已成功注册！\n"
-            f"• 密钥: ||{key[:5]}...{key[-4:]}||\n"
-            f"• 共享设置: {sharing_text}\n"
-            f"• 有效期: {expiry_text}\n"
-            f"• 持久存储: 已启用\n\n{storage_info}",
-            ephemeral=True
-        )
-    else:
-        # 如果用户选择不持久化，则使用原来的消息格式
-        await interaction.response.send_message(
-            f"✅ API密钥已成功注册！\n"
-            f"• 密钥: ||{key[:5]}...{key[-4:]}||\n"
-            f"• 共享设置: {sharing_text}\n"
-            f"• 有效期: {expiry_text}\n"
-            f"• 持久存储: 未启用（机器人重启后将失效）",
-            ephemeral=True
-        )
-
-# 删除密钥命令
-@tree.command(name="deletekey", description="删除你注册的NovelAI API密钥")
-async def deletekey_command(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    
-    if user_id in api_keys:
-        was_persistent = api_keys[user_id].get("persist", False)
-        del api_keys[user_id]
-        
-        # 如果是持久化密钥，立即更新存储
-        if was_persistent:
-            save_api_keys_to_file()
-        
-        await interaction.response.send_message(
-            "✅ 你的API密钥已从机器人中删除。" + 
-            ("所有持久化存储的数据也已清除。" if was_persistent else ""), 
-            ephemeral=True
-        )
-    else:
-        await interaction.response.send_message("你没有注册API密钥。", ephemeral=True)
-
-# 添加密钥到服务器共享命令
-@tree.command(name="addsharing", description="将你的API密钥添加到当前服务器共享列表")
-async def addsharing_command(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    guild_id = interaction.guild_id
-    
-    if not guild_id:
-        await interaction.response.send_message("此命令只能在服务器中使用。", ephemeral=True)
-        return
-    
-    if user_id not in api_keys:
-        await interaction.response.send_message("你没有注册API密钥。请先使用 `/apikey` 命令注册。", ephemeral=True)
-        return
-    
-    user_key = api_keys[user_id]
-    
-    # 检查密钥是否已过期
-    if "expires_at" in user_key and user_key["expires_at"] is not None and user_key["expires_at"] < datetime.datetime.now():
-        await interaction.response.send_message("你的API密钥已过期，请重新注册。", ephemeral=True)
-        del api_keys[user_id]
-        return
-    
-    # 如果服务器已在共享列表中
-    if guild_id in user_key.get("shared_guilds", []):
-        await interaction.response.send_message("你的API密钥已在此服务器共享。", ephemeral=True)
-        return
-    
-    # 添加服务器到共享列表
-    if "shared_guilds" not in user_key:
-        user_key["shared_guilds"] = []
-    
-    user_key["shared_guilds"].append(guild_id)
-    
-    # 如果是持久化存储的密钥，保存更新
-    if user_key.get("persist", False):
-        save_api_keys_to_file()
-        
-    await interaction.response.send_message("✅ 你的API密钥现在已在此服务器共享。", ephemeral=True)
-
-# 从服务器共享列表中移除密钥命令
-@tree.command(name="removesharing", description="从当前服务器共享列表中移除你的API密钥")
-async def removesharing_command(interaction: discord.Interaction):
-    user_id = str(interaction.user.id)
-    guild_id = interaction.guild_id
-    
-    if not guild_id:
-        await interaction.response.send_message("此命令只能在服务器中使用。", ephemeral=True)
-        return
-    
-    if user_id not in api_keys:
-        await interaction.response.send_message("你没有注册API密钥。", ephemeral=True)
-        return
-    
-    user_key = api_keys[user_id]
-    
-    # 如果服务器不在共享列表中
-    if guild_id not in user_key.get("shared_guilds", []):
-        await interaction.response.send_message("你的API密钥未在此服务器共享。", ephemeral=True)
-        return
-    
-    # 从共享列表中移除服务器
-    user_key["shared_guilds"].remove(guild_id)
-    
-    # 如果是持久化存储的密钥，保存更新
-    if user_key.get("persist", False):
-        save_api_keys_to_file()
-        
-    await interaction.response.send_message("✅ 你的API密钥已从此服务器共享列表中移除。", ephemeral=True)
 
 # 智能选择共享密钥
 async def select_optimal_key(shared_keys):
@@ -866,158 +577,109 @@ async def get_api_key(interaction: discord.Interaction) -> tuple[Optional[str], 
                 
                 return key_data["key"], f"{provider_name} 共享的密钥"  # 使用共享密钥，显示提供者信息
     
-    # 用户没有注册密钥，也没有可用的共享密钥
+    # 显示错误消息-没有可用密钥
+    msg = "⚠️ 你需要先注册你的NovelAI API密钥才能使用此功能。"
     if guild_id:
         shared_keys_info = get_guild_shared_keys_info(guild_id)
         if shared_keys_info:
-            await interaction.followup.send(
-                f"⚠️ 你需要先注册你的NovelAI API密钥才能使用此功能。\n\n"
-                f"当前服务器有 {len(shared_keys_info)} 个共享的API密钥，但这些密钥可能已过期或不可用。\n"
-                f"请使用 `/apikey [你的密钥]` 命令注册，或联系密钥提供者更新共享设置。", 
-                ephemeral=True
-            )
-        else:
-            await interaction.followup.send(
-                "⚠️ 你需要先注册你的NovelAI API密钥才能使用此功能。请使用 `/apikey [你的密钥]` 命令注册。", 
-                ephemeral=True
-            )
+            msg += f"\n\n当前服务器有 {len(shared_keys_info)} 个共享的API密钥，但这些密钥可能已过期或不可用。"
+        msg += "\n请使用 `/apikey [你的密钥]` 命令注册" + ("，或联系密钥提供者更新共享设置。" if shared_keys_info else "。")
     else:
-        await interaction.followup.send(
-            "⚠️ 你需要先注册你的NovelAI API密钥才能使用此功能。请使用 `/apikey [你的密钥]` 命令注册。", 
-            ephemeral=True
-        )
+        msg += "请使用 `/apikey [你的密钥]` 命令注册。"
     
+    await interaction.followup.send(msg, ephemeral=True)
     return None, None
 
-# 展示服务器共享密钥列表
-@tree.command(name="sharedkeys", description="显示当前服务器中共享的API密钥信息")
-async def sharedkeys_command(interaction: discord.Interaction):
-    if not interaction.guild_id:
-        await interaction.response.send_message("此命令只能在服务器中使用。", ephemeral=True)
-        return
-    
-    shared_keys = get_guild_shared_keys_info(interaction.guild_id)
-    
-    if not shared_keys:
-        await interaction.response.send_message("当前服务器没有共享的API密钥。", ephemeral=True)
-        return
-    
-    embed = discord.Embed(
-        title=f"服务器共享API密钥 ({len(shared_keys)}个)",
-        description="以下用户提供了API密钥在此服务器共享使用：",
-        color=0xf75c7e
-    )
-    
-    for i, key_info in enumerate(shared_keys, 1):
-        embed.add_field(
-            name=f"密钥 #{i}",
-            value=f"提供者: {key_info['provider_name']}\n过期时间: {key_info['expires_at']}",
-            inline=True
-        )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+# ===== 后台任务 =====
+# 定期保存任务
+async def periodic_save_keys():
+    """定期保存标记为持久化的API密钥和提示词模板"""
+    while True:
+        await asyncio.sleep(60 * 15)  # 每15分钟保存一次
+        save_api_keys_to_file()
+        save_templates_to_file()
+        print(f"[{datetime.datetime.now()}] 已执行定期保存")
 
-# 添加NovelAI API状态检查命令
-@tree.command(name="checkapi", description="检查NovelAI API的可用性状态")
-async def checkapi_command(interaction: discord.Interaction):
-    await interaction.response.defer()
+# 检查API密钥有效性
+async def check_api_key_validity(api_key):
+    """检查API密钥是否有效"""
+    test_payload = {
+        "input": "test",
+        "model": "nai-diffusion-3",
+        "action": "generate",
+        "parameters": {
+            "width": 64,  # 使用最小尺寸
+            "height": 64,
+            "scale": 1.0,
+            "sampler": "k_euler",
+            "steps": 1,  # 使用最小步数减少服务器负担
+            "n_samples": 1,
+            "qualityToggle": False
+        }
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Referer": "https://novelai.net",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
+    }
     
     try:
-        # 检查NovelAI网站连通性
-        site_response = await client.loop.run_in_executor(
-            None,
-            lambda: requests.get("https://novelai.net/", timeout=10)
+        response = await client.loop.run_in_executor(
+            None, 
+            lambda: requests.post(
+                NAI_API_URL,
+                headers=headers,
+                json=test_payload,
+                timeout=10
+            )
         )
         
-        if site_response.status_code == 200:
-            site_status = "✅ NovelAI网站可以访问，API可能正常工作。"
-        else:
-            site_status = f"⚠️ NovelAI网站返回了状态码 {site_response.status_code}，API可能存在问题。"
-    
-    except requests.exceptions.RequestException as e:
-        site_status = f"❌ 无法连接到NovelAI网站: {str(e)}"
-    
-    embed = discord.Embed(
-        title="NovelAI API 状态检查",
-        color=0xf75c7e
-    )
-    
-    embed.add_field(name="当前状态", value=site_status, inline=False)
-    embed.add_field(name="已知问题", 
-                   value="• v4模型可能返回500内部服务器错误\n• 如果遇到v4模型的500错误，建议尝试使用v3模型代替。", 
-                   inline=False)
-    
-    await interaction.followup.send(embed=embed)
+        # 检查响应状态码
+        if response.status_code in (401, 402):
+            return False
+        return True
+    except:
+        # 连接错误也视为可能无效
+        return False
 
-# 添加Bot状态检查命令
-@tree.command(name="botstatus", description="检查机器人的当前状态和性能")
-async def botstatus_command(interaction: discord.Interaction):
-    # 延迟响应，告诉Discord我们需要更多时间
-    await interaction.response.defer()
-    
-    # 收集状态信息
-    total_keys = len(api_keys)
-    shared_keys_count = len([1 for key_data in api_keys.values() if key_data.get("shared_guilds")])
-    persistent_keys = len([1 for key_data in api_keys.values() if key_data.get("persist", False)])
-    
-    # 计算即将过期的密钥
-    soon_expire = 0
-    for key_data in api_keys.values():
-        if "expires_at" in key_data and key_data["expires_at"]:
-            time_left = (key_data["expires_at"] - datetime.datetime.now()).total_seconds()
-            if 0 < time_left < 24*3600:  # 24小时内过期
-                soon_expire += 1
-    
-    # 计算机器人运行时间 - 使用全局启动时间变量
-    current_time = datetime.datetime.now()
-    uptime = current_time - BOT_START_TIME
-    
-    days = uptime.days
-    hours, remainder = divmod(uptime.seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    uptime_str = f"{days}天 {hours}小时 {minutes}分钟 {seconds}秒"
-    
-    # 构建状态嵌入消息
-    embed = discord.Embed(
-        title="📊 NovelAI Bot 状态",
-        description="机器人当前运行状态和性能信息",
-        color=0x3498db
-    )
-    
-    embed.add_field(name="🤖 运行状态", value="✅ 正常运行中", inline=False)
-    embed.add_field(name="🔑 API密钥统计", 
-                   value=f"总数: {total_keys}\n共享密钥: {shared_keys_count}\n持久化密钥: {persistent_keys}\n即将过期: {soon_expire}", 
-                   inline=True)
-    embed.add_field(name="📡 Discord连接", 
-                   value=f"延迟: {round(client.latency * 1000, 2)}ms", 
-                   inline=True)
-    embed.add_field(name="⏱️ 运行时间", 
-                   value=f"{uptime_str}", 
-                   inline=True)
-    
-    # NovelAI API状态检查结果
-    try:
-        # 简单检查NovelAI网站连通性
-        site_response = await client.loop.run_in_executor(
-            None,
-            lambda: requests.get("https://novelai.net/", timeout=5)
-        )
+# 每小时检查密钥有效性
+async def hourly_validate_keys():
+    """每小时检查API密钥有效性"""
+    while True:
+        await asyncio.sleep(3600)  # 每小时检查一次
+        print(f"[{datetime.datetime.now()}] 开始执行API密钥有效性检查...")
         
-        if site_response.status_code == 200:
-            api_status = "✅ 可用"
-        else:
-            api_status = f"⚠️ 状态码: {site_response.status_code}"
-    
-    except requests.exceptions.RequestException:
-        api_status = "❌ 连接失败"
-    
-    embed.add_field(name="🌐 NovelAI API", value=api_status, inline=False)
-    
-    # 添加版本信息和时间戳
-    embed.set_footer(text=f"Bot版本: 1.2.0 • {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # 使用followup而不是直接响应，因为我们已经延迟了
-    await interaction.followup.send(embed=embed)
+        invalid_keys = []
+        checked_count = 0
+        
+        for user_id, key_data in list(api_keys.items()):
+            # 先检查是否已过期
+            if "expires_at" in key_data and key_data["expires_at"] and key_data["expires_at"] < datetime.datetime.now():
+                invalid_keys.append(user_id)
+                continue
+            
+            # 检查API密钥有效性
+            is_valid = await check_api_key_validity(key_data["key"])
+            checked_count += 1
+            
+            if not is_valid:
+                invalid_keys.append(user_id)
+            
+            # 每检查几个密钥暂停一下，避免过快请求
+            if checked_count % 5 == 0:
+                await asyncio.sleep(2)
+        
+        # 移除无效密钥
+        for user_id in invalid_keys:
+            del api_keys[user_id]
+        
+        # 如果有删除持久化密钥，保存更新
+        if any(user_id in api_keys and api_keys[user_id].get("persist", False) for user_id in invalid_keys):
+            save_api_keys_to_file()
+        
+        print(f"[{datetime.datetime.now()}] API密钥检查完成，检查了 {checked_count} 个密钥，移除了 {len(invalid_keys)} 个无效密钥")
 
 # 定期检查过期密钥
 async def check_expired_keys():
@@ -1045,13 +707,729 @@ async def check_expired_keys():
             if any(user_id in api_keys and api_keys[user_id].get("persist", False) for user_id in expired_keys):
                 save_api_keys_to_file()
 
-# 新增高级生成命令
+# 队列处理器
+async def queue_processor():
+    """持续处理所有队列中的请求"""
+    while True:
+        processed = False
+        
+        # 处理所有活跃队列
+        for queue_id, queue_data in list(generation_queues.items()):
+            if queue_data["queue"] and not queue_data["processing"]:
+                # 标记为处理中
+                queue_data["processing"] = True
+                
+                try:
+                    # 处理队列头部的请求
+                    request = queue_data["queue"][0]
+                    await process_queued_request(request)
+                    processed = True
+                except Exception as e:
+                    print(f"处理队列请求时出错: {str(e)}")
+                    try:
+                        interaction = request.get("interaction")
+                        await interaction.followup.send(f"❌ 队列处理失败: {str(e)}", ephemeral=True)
+                    except:
+                        pass
+                finally:
+                    # 移除已处理的请求
+                    queue_data["queue"].pop(0)
+                    queue_data["processing"] = False
+                    queue_data["last_processed"] = datetime.datetime.now()
+                
+                # 避免过快处理所有请求
+                break  
+        
+        # 调整等待时间，避免无限循环消耗资源
+        if not processed:
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(3)  # 请求间隔，避免API限制
+
+async def process_queued_request(request):
+    """处理队列中的单个请求"""
+    interaction = request.get("interaction")
+    api_key = request.get("api_key") 
+    payload = request.get("payload")
+    provider_info = request.get("provider_info")
+    is_batch = request.get("is_batch", False)
+    batch_index = request.get("batch_index", 0)
+    batch_total = request.get("batch_total", 1)
+    
+    # 复用现有的API请求处理函数
+    image_data = await send_novelai_request(api_key, payload, interaction)
+    if image_data is None:
+        raise Exception("图像生成失败")
+    
+    # 创建文件并发送 - 复用现有模式
+    file = discord.File(io.BytesIO(image_data), filename=f"queued_image_{int(time.time())}.png")
+    
+    title = "批量生成" if is_batch else "队列生成"
+    if is_batch:
+        title += f" ({batch_index+1}/{batch_total})"
+        
+    embed = discord.Embed(title=title, color=0xf75c7e)
+    embed.add_field(name="提示词", value=payload.get("input", "")[:1024], inline=False)
+    embed.add_field(name="模型", value=payload.get("model", DEFAULT_MODEL), inline=True)
+    
+    if provider_info:
+        embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
+        
+    embed.set_image(url=f"attachment://queued_image_{int(time.time())}.png")
+    embed.set_footer(text=f"由 {interaction.user.display_name} 生成")
+    
+    await interaction.followup.send(file=file, embed=embed)
+
+# 协作会话清理
+async def cleanup_expired_sessions():
+    """定期清理过期的协作会话"""
+    while True:
+        await asyncio.sleep(60)  # 每分钟检查一次
+        
+        now = datetime.datetime.now()
+        
+        # 清理过期的接力会话
+        expired_relays = []
+        for session_id, session in relay_sessions.items():
+            if session["expires_at"] < now:
+                expired_relays.append(session_id)
+                
+                # 发送过期通知
+                try:
+                    channel = client.get_channel(int(session["channel_id"]))
+                    if channel:
+                        await channel.send(f"⏰ 接力生成会话 `{session_id}` 已过期。")
+                except:
+                    pass
+        
+        # 删除过期会话
+        for session_id in expired_relays:
+            del relay_sessions[session_id]
+            
+        if expired_relays:
+            print(f"已清理 {len(expired_relays)} 个过期的接力会话")
+
+# 创建接力生成的按钮视图
+class RelayButtons(discord.ui.View):
+    def __init__(self, session_id, expires_at):
+        # 计算超时时间
+        timeout = (expires_at - datetime.datetime.now()).total_seconds()
+        super().__init__(timeout=timeout)
+        self.session_id = session_id
+        
+    @discord.ui.button(label="添加内容", style=discord.ButtonStyle.primary, emoji="➕")
+    async def add_content_button(self, interaction, button):
+        # 使用全局处理函数
+        await handle_relay_add_content(interaction, self.session_id)
+        
+    @discord.ui.button(label="完成接力", style=discord.ButtonStyle.success, emoji="✅")
+    async def complete_relay_button(self, interaction, button):
+        # 使用全局处理函数
+        await handle_relay_complete(interaction, self.session_id)
+
+# ===== 机器人初始化 =====
+@client.event
+async def on_ready():
+    print(f'机器人已登录为 {client.user}')
+    
+    await tree.sync()  # 同步斜杠命令
+    
+    # 从文件加载API密钥
+    global api_keys, prompt_templates
+    loaded_keys = load_api_keys_from_file()
+    if loaded_keys:
+        api_keys.update(loaded_keys)
+        print(f"已从文件加载 {len(loaded_keys)} 个API密钥")
+        
+    # 加载提示词模板
+    loaded_templates = load_templates_from_file()
+    if loaded_templates:
+        prompt_templates = loaded_templates
+        print(f"已加载 {len(loaded_templates)} 个提示词模板")
+    
+    # 初始化队列系统
+    global generation_queues
+    generation_queues = {}
+    client.loop.create_task(queue_processor())
+    print("队列系统已初始化")
+    
+    # 初始化协作系统
+    global relay_sessions
+    relay_sessions = {}
+    client.loop.create_task(cleanup_expired_sessions())
+    print("协作生成系统已初始化")
+    
+    # 启动各种后台任务
+    client.loop.create_task(check_expired_keys())  # 密钥过期检查
+    client.loop.create_task(periodic_save_keys())  # 定期保存
+    client.loop.create_task(hourly_validate_keys())  # 密钥验证
+    
+    print(f"机器人 v{VERSION} 已完全初始化并准备就绪")
+
+# ===== API密钥管理命令 =====
+@tree.command(name="apikey", description="注册或管理你的NovelAI API密钥")
+@app_commands.describe(
+    key="你的NovelAI API密钥",
+    sharing="设置密钥是否在此服务器共享",
+    duration_hours="密钥有效时间(小时), 0表示永不过期",
+    persist="是否在机器人重启后保存密钥（会进行存储）"
+)
+async def apikey_command(
+    interaction: discord.Interaction, 
+    key: str = None,
+    sharing: Literal["私人使用", "服务器共享"] = "私人使用",
+    duration_hours: int = 24,
+    persist: Literal["是", "否"] = "否"
+):
+    user_id = str(interaction.user.id)
+    
+    # 检查是否是查看密钥信息请求
+    if key is None:
+        if user_id in api_keys:
+            user_key = api_keys[user_id]
+            
+            # 检查密钥是否已过期
+            if "expires_at" in user_key and user_key["expires_at"] is not None and user_key["expires_at"] < datetime.datetime.now():
+                await interaction.response.send_message("你的API密钥已过期，请重新注册。", ephemeral=True)
+                del api_keys[user_id]
+                return
+            
+            # 构建密钥信息
+            expiry = "永不过期" if "expires_at" not in user_key or user_key["expires_at"] is None else f"{user_key['expires_at'].strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            # 查看共享信息
+            if not user_key.get("shared_guilds"):
+                sharing_info = "私人使用"
+            else:
+                sharing_info = f"共享的服务器: {len(user_key['shared_guilds'])}个"
+                if interaction.guild_id and interaction.guild_id in user_key.get("shared_guilds", []):
+                    sharing_info += " (包括当前服务器)"
+            
+            # 检查是否是持久化存储
+            persist_info = "是" if user_key.get("persist", False) else "否"
+            
+            await interaction.response.send_message(
+                f"你已注册API密钥:\n"
+                f"• 密钥状态: 有效\n"
+                f"• 共享设置: {sharing_info}\n"
+                f"• 过期时间: {expiry}\n"
+                f"• 持久化存储: {persist_info}", 
+                ephemeral=True
+            )
+        else:
+            # 如果在服务器中，显示当前服务器的共享密钥信息
+            if interaction.guild_id:
+                shared_keys = get_guild_shared_keys_info(interaction.guild_id)
+                shared_info = f"当前服务器有 {len(shared_keys)} 个共享的API密钥。"
+                if shared_keys:
+                    providers = [key_info["provider_name"] for key_info in shared_keys]
+                    shared_info += f" 提供者: {', '.join(providers)}"
+                
+                await interaction.response.send_message(
+                    f"你还没有注册API密钥。请使用 `/apikey [你的密钥] [共享设置] [有效时间]` 来注册。\n\n{shared_info}",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    "你还没有注册API密钥。请使用 `/apikey [你的密钥] [共享设置] [有效时间]` 来注册。",
+                    ephemeral=True
+                )
+        return
+    
+    # 验证API密钥格式
+    if not key.startswith("pst-") or len(key) < 15:
+        await interaction.response.send_message(
+            "❌ API密钥格式无效。NovelAI的API密钥应以'pst-'开头并包含足够长度。",
+            ephemeral=True
+        )
+        return
+        
+    # 为用户注册新密钥
+    guild_id = interaction.guild_id if interaction.guild_id and sharing == "服务器共享" else None
+    
+    # 设置过期时间
+    expires_at = None
+    if duration_hours > 0:
+        expires_at = datetime.datetime.now() + datetime.timedelta(hours=duration_hours)
+    
+    # 保存密钥信息
+    api_keys[user_id] = {
+        "key": key,
+        "shared_guilds": [guild_id] if guild_id else [],
+        "expires_at": expires_at,
+        "provider_name": interaction.user.display_name,  # 记录提供者名称
+        "persist": persist == "是"  # 添加是否持久化的标志
+    }
+    
+    # 构建确认信息
+    expiry_text = "永不过期" if expires_at is None else f"{duration_hours}小时后过期 ({expires_at.strftime('%Y-%m-%d %H:%M:%S')})"
+    sharing_text = "仅限你个人使用" if not guild_id else f"在此服务器共享使用"
+    
+    # 如果用户选择了持久化存储
+    if persist == "是":
+        # 告知用户关于存储的信息
+        storage_info = (
+            "⚠️ **关于密钥存储的重要信息**\n"
+            "• 你的API密钥将被存储在机器人所在的服务器上\n"
+            "• 这样在机器人重启后你的密钥设置仍然有效\n"
+            "• 你可以随时使用`/deletekey`命令删除你的密钥\n"
+            "• 密钥仍会按照设定的有效期自动失效"
+        )
+        
+        # 保存密钥数据
+        save_api_keys_to_file()
+        
+        await interaction.response.send_message(
+            f"✅ API密钥已成功注册！\n"
+            f"• 密钥: ||{key[:5]}...{key[-4:]}||\n"
+            f"• 共享设置: {sharing_text}\n"
+            f"• 有效期: {expiry_text}\n"
+            f"• 持久存储: 已启用\n\n{storage_info}",
+            ephemeral=True
+        )
+    else:
+        # 如果用户选择不持久化，则使用原来的消息格式
+        await interaction.response.send_message(
+            f"✅ API密钥已成功注册！\n"
+            f"• 密钥: ||{key[:5]}...{key[-4:]}||\n"
+            f"• 共享设置: {sharing_text}\n"
+            f"• 有效期: {expiry_text}\n"
+            f"• 持久存储: 未启用（机器人重启后将失效）",
+            ephemeral=True
+        )
+
+@tree.command(name="deletekey", description="删除你注册的NovelAI API密钥")
+async def deletekey_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    
+    if user_id in api_keys:
+        was_persistent = api_keys[user_id].get("persist", False)
+        del api_keys[user_id]
+        
+        # 如果是持久化密钥，立即更新存储
+        if was_persistent:
+            save_api_keys_to_file()
+        
+        await interaction.response.send_message(
+            "✅ 你的API密钥已从机器人中删除。" + 
+            ("所有持久化存储的数据也已清除。" if was_persistent else ""), 
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message("你没有注册API密钥。", ephemeral=True)
+
+@tree.command(name="addsharing", description="将你的API密钥添加到当前服务器共享列表")
+async def addsharing_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    guild_id = interaction.guild_id
+    
+    if not guild_id:
+        await interaction.response.send_message("此命令只能在服务器中使用。", ephemeral=True)
+        return
+    
+    if user_id not in api_keys:
+        await interaction.response.send_message("你没有注册API密钥。请先使用 `/apikey` 命令注册。", ephemeral=True)
+        return
+    
+    user_key = api_keys[user_id]
+    
+    # 检查密钥是否已过期
+    if "expires_at" in user_key and user_key["expires_at"] is not None and user_key["expires_at"] < datetime.datetime.now():
+        await interaction.response.send_message("你的API密钥已过期，请重新注册。", ephemeral=True)
+        del api_keys[user_id]
+        return
+    
+    # 如果服务器已在共享列表中
+    if guild_id in user_key.get("shared_guilds", []):
+        await interaction.response.send_message("你的API密钥已在此服务器共享。", ephemeral=True)
+        return
+    
+    # 添加服务器到共享列表
+    if "shared_guilds" not in user_key:
+        user_key["shared_guilds"] = []
+    
+    user_key["shared_guilds"].append(guild_id)
+    
+    # 如果是持久化存储的密钥，保存更新
+    if user_key.get("persist", False):
+        save_api_keys_to_file()
+        
+    await interaction.response.send_message("✅ 你的API密钥现在已在此服务器共享。", ephemeral=True)
+
+@tree.command(name="removesharing", description="从当前服务器共享列表中移除你的API密钥")
+async def removesharing_command(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    guild_id = interaction.guild_id
+    
+    if not guild_id:
+        await interaction.response.send_message("此命令只能在服务器中使用。", ephemeral=True)
+        return
+    
+    if user_id not in api_keys:
+        await interaction.response.send_message("你没有注册API密钥。", ephemeral=True)
+        return
+    
+    user_key = api_keys[user_id]
+    
+    # 如果服务器不在共享列表中
+    if guild_id not in user_key.get("shared_guilds", []):
+        await interaction.response.send_message("你的API密钥未在此服务器共享。", ephemeral=True)
+        return
+    
+    # 从共享列表中移除服务器
+    user_key["shared_guilds"].remove(guild_id)
+    
+    # 如果是持久化存储的密钥，保存更新
+    if user_key.get("persist", False):
+        save_api_keys_to_file()
+        
+    await interaction.response.send_message("✅ 你的API密钥已从此服务器共享列表中移除。", ephemeral=True)
+
+@tree.command(name="sharedkeys", description="显示当前服务器中共享的API密钥信息")
+async def sharedkeys_command(interaction: discord.Interaction):
+    if not interaction.guild_id:
+        await interaction.response.send_message("此命令只能在服务器中使用。", ephemeral=True)
+        return
+    
+    shared_keys = get_guild_shared_keys_info(interaction.guild_id)
+    
+    if not shared_keys:
+        await interaction.response.send_message("当前服务器没有共享的API密钥。", ephemeral=True)
+        return
+    
+    embed = discord.Embed(
+        title=f"服务器共享API密钥 ({len(shared_keys)}个)",
+        description="以下用户提供了API密钥在此服务器共享使用：",
+        color=0xf75c7e
+    )
+    
+    for i, key_info in enumerate(shared_keys, 1):
+        embed.add_field(
+            name=f"密钥 #{i}",
+            value=f"提供者: {key_info['provider_name']}\n过期时间: {key_info['expires_at']}",
+            inline=True
+        )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ===== 提示词模板管理命令 =====
+@tree.command(name="savetemplate", description="保存当前提示词为模板")
+@app_commands.describe(
+    name="模板名称",
+    prompt="提示词内容",
+    sharing="设置模板是否在此服务器共享",
+    tags="标签，用逗号分隔（例如: 风景,动漫）"
+)
+async def savetemplate_command(
+    interaction: discord.Interaction, 
+    name: str, 
+    prompt: str, 
+    sharing: Literal["私人使用", "服务器共享"] = "私人使用",
+    tags: str = ""
+):
+    user_id = str(interaction.user.id)
+    template_id = f"{user_id}_{int(time.time())}"
+    guild_id = interaction.guild_id if interaction.guild_id and sharing == "服务器共享" else None
+    
+    # 保存模板信息
+    prompt_templates[template_id] = {
+        "name": name,
+        "prompt": prompt,
+        "creator_id": user_id,
+        "creator_name": interaction.user.display_name,
+        "shared_guilds": [guild_id] if guild_id else [],
+        "tags": [tag.strip() for tag in tags.split(",") if tag.strip()],
+        "created_at": datetime.datetime.now().isoformat()
+    }
+    
+    # 保存模板
+    save_templates_to_file()
+    
+    # 构建确认信息
+    sharing_text = "仅限你个人使用" if not guild_id else f"在此服务器共享使用"
+    tags_text = tags if tags else "无"
+    
+    await interaction.response.send_message(
+        f"✅ 提示词模板 \"{name}\" 已保存！\n"
+        f"• 提示词: {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n"
+        f"• 共享设置: {sharing_text}\n"
+        f"• 标签: {tags_text}\n"
+        f"• 模板ID: {template_id}\n\n"
+        f"使用 `/usetemplate {template_id}` 来使用此模板生成图像。",
+        ephemeral=True
+    )
+
+@tree.command(name="listtemplates", description="查看可用的提示词模板")
+@app_commands.describe(
+    filter_tags="按标签筛选（用逗号分隔）",
+    show_all="是否显示所有共享模板"
+)
+async def listtemplates_command(
+    interaction: discord.Interaction, 
+    filter_tags: str = "",
+    show_all: bool = False
+):
+    user_id = str(interaction.user.id)
+    guild_id = interaction.guild_id
+    
+    # 处理筛选标签
+    tags_filter = [tag.strip().lower() for tag in filter_tags.split(",") if tag.strip()]
+    
+    # 收集符合条件的模板
+    available_templates = []
+    
+    for template_id, template in prompt_templates.items():
+        # 判断用户是否有权访问此模板
+        is_creator = template.get("creator_id") == user_id
+        is_guild_shared = guild_id in template.get("shared_guilds", [])
+        
+        if is_creator or is_guild_shared or show_all:
+            # 如果有标签筛选，则检查标签
+            if tags_filter:
+                template_tags = [tag.lower() for tag in template.get("tags", [])]
+                if not any(tag in template_tags for tag in tags_filter):
+                    continue
+            
+            # 收集模板信息
+            template_info = {
+                "id": template_id,
+                "name": template.get("name", "未命名模板"),
+                "creator": template.get("creator_name", "未知创建者"),
+                "tags": template.get("tags", []),
+                "is_creator": is_creator,
+                "is_shared": is_guild_shared
+            }
+            available_templates.append(template_info)
+    
+    if not available_templates:
+        await interaction.response.send_message(
+            f"没有找到符合条件的提示词模板。" +
+            (f"尝试使用不同的标签筛选或选择「显示所有模板」。" if tags_filter else "尝试使用 `/savetemplate` 创建新模板。"),
+            ephemeral=True
+        )
+        return
+    
+    # 创建嵌入消息
+    embed = discord.Embed(
+        title=f"提示词模板 ({len(available_templates)}个)",
+        description=f"以下是你可以访问的提示词模板：" +
+                   (f"\n筛选标签: {filter_tags}" if filter_tags else ""),
+        color=0x3498db
+    )
+    
+    # 最多显示20个模板
+    if len(available_templates) > 20:
+        embed.set_footer(text=f"共找到 {len(available_templates)} 个模板，仅显示前20个")
+        available_templates = available_templates[:20]
+    
+    # 添加每个模板的信息
+    for i, template in enumerate(available_templates, 1):
+        tags_display = ", ".join(template["tags"]) if template["tags"] else "无标签"
+        source_display = "✓ 你创建的" if template["is_creator"] else "👥 服务器共享" if template["is_shared"] else "🌐 全局共享"
+        
+        embed.add_field(
+            name=f"{i}. {template['name']}",
+            value=f"ID: `{template['id']}`\n创建者: {template['creator']}\n标签: {tags_display}\n{source_display}",
+            inline=i % 2 == 1  # 交替布局
+        )
+    
+    # 显示用法信息
+    embed.add_field(
+        name="使用方法",
+        value="使用 `/usetemplate [模板ID]` 来应用模板生成图像。\n例如: `/usetemplate " + available_templates[0]["id"] + "`",
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="usetemplate", description="使用提示词模板生成图像")
+@app_commands.describe(
+    template_id="模板ID（从 /listtemplates 获取）",
+    model="选择模型"
+)
+@app_commands.choices(
+    model=[
+        app_commands.Choice(name=f"{model} - {MODEL_DESCRIPTIONS[model]}", value=model)
+        for model in AVAILABLE_MODELS
+    ]
+)
+async def usetemplate_command(
+    interaction: discord.Interaction, 
+    template_id: str,
+    model: str = None
+):
+    await interaction.response.defer(thinking=True)
+    
+    # 获取API密钥
+    api_key, provider_info = await get_api_key(interaction)
+    if not api_key:
+        return
+    
+    # 查找模板
+    if template_id not in prompt_templates:
+        await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+        return
+    
+    template = prompt_templates[template_id]
+    user_id = str(interaction.user.id)
+    guild_id = interaction.guild_id
+    
+    # 检查访问权限
+    is_creator = template.get("creator_id") == user_id
+    is_guild_shared = guild_id in template.get("shared_guilds", [])
+    
+    if not (is_creator or is_guild_shared):
+        await interaction.followup.send("❌ 你没有权限使用此模板。它可能是私人模板或未在此服务器共享。", ephemeral=True)
+        return
+    
+    # 获取模板提示词
+    prompt = template.get("prompt", "")
+    if not prompt:
+        await interaction.followup.send("❌ 此模板不包含有效的提示词。", ephemeral=True)
+        return
+    
+    # 验证并设置模型
+    selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
+    
+    # 获取适合模型的参数
+    model_params = get_model_default_params(selected_model)
+    
+    # 准备API请求
+    payload = {
+        "input": prompt,
+        "model": selected_model,
+        "action": "generate",
+        "parameters": model_params
+    }
+    
+    # 使用统一的API请求处理函数
+    image_data = await send_novelai_request(api_key, payload, interaction)
+    if image_data is None:
+        return  # 如果API请求失败，直接返回
+    
+    # 创建文件对象并发送
+    file = discord.File(io.BytesIO(image_data), filename="template_generated.png")
+    
+    # 创建嵌入消息
+    embed = discord.Embed(title=f"模板生成: {template.get('name')}", color=0x3498db)
+    embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+    embed.add_field(name="模型", value=selected_model, inline=True)
+    embed.add_field(name="模板创建者", value=template.get("creator_name", "未知"), inline=True)
+    
+    if template.get("tags"):
+        embed.add_field(name="标签", value=", ".join(template.get("tags")), inline=True)
+    
+    # 显示API密钥提供者信息
+    if provider_info:
+        embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
+        
+    embed.set_image(url="attachment://template_generated.png")
+    embed.set_footer(text=f"由 {interaction.user.display_name} 使用模板生成")
+    
+    await interaction.followup.send(file=file, embed=embed)
+
+@tree.command(name="deletetemplate", description="删除你创建的提示词模板")
+@app_commands.describe(
+    template_id="要删除的模板ID"
+)
+async def deletetemplate_command(interaction: discord.Interaction, template_id: str):
+    user_id = str(interaction.user.id)
+    
+    # 检查模板是否存在
+    if template_id not in prompt_templates:
+        await interaction.response.send_message("❌ 未找到指定的模板。", ephemeral=True)
+        return
+    
+    # 检查是否是创建者
+    template = prompt_templates[template_id]
+    if template.get("creator_id") != user_id:
+        await interaction.response.send_message("❌ 你不是此模板的创建者，无法删除。", ephemeral=True)
+        return
+    
+    # 删除模板
+    template_name = template.get("name", "未命名模板")
+    del prompt_templates[template_id]
+    
+    # 保存更新
+    save_templates_to_file()
+    
+    await interaction.response.send_message(f"✅ 已删除模板 \"{template_name}\"。", ephemeral=True)
+
+# ===== 图像生成命令 =====
+@tree.command(name="nai", description="使用NovelAI生成图像")
+@app_commands.describe(
+    prompt="图像生成提示词",
+    model="模型选择"
+)
+@app_commands.choices(
+    model=[
+        app_commands.Choice(name=f"{model} - {MODEL_DESCRIPTIONS[model]}", value=model)
+        for model in AVAILABLE_MODELS
+    ]
+)
+async def nai_command(
+    interaction: discord.Interaction, 
+    prompt: str,
+    model: str = None
+):
+    await interaction.response.defer(thinking=True)
+    
+    try:
+        # 获取API密钥
+        api_key, provider_info = await get_api_key(interaction)
+        if not api_key:
+            return
+        
+        # 验证并设置模型
+        selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
+        
+        # 获取适合模型的参数
+        model_params = get_model_default_params(selected_model)
+        
+        # 准备API请求
+        payload = {
+            "input": prompt,
+            "model": selected_model,
+            "action": "generate",
+            "parameters": model_params
+        }
+        
+        # 使用统一的API请求处理函数
+        image_data = await send_novelai_request(api_key, payload, interaction)
+        if image_data is None:
+            return  # 如果API请求失败，直接返回
+        
+        # 创建文件对象并发送
+        file = discord.File(io.BytesIO(image_data), filename="generated_image.png")
+        
+        # 创建基本嵌入消息
+        embed = discord.Embed(title="NovelAI 生成图像", color=0xf75c7e)
+        embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+        embed.add_field(name="模型", value=selected_model, inline=True)
+        
+        # 如果使用的是共享密钥，显示提供者信息
+        if provider_info:
+            if provider_info == "自己的密钥":
+                embed.add_field(name="🔑 API密钥", value="使用自己的密钥", inline=True)
+            else:
+                embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
+            
+        embed.set_image(url="attachment://generated_image.png")
+        embed.set_footer(text=f"由 {interaction.user.display_name} 生成")
+        
+        await interaction.followup.send(file=file, embed=embed)
+        
+    except Exception as e:
+        print(f"生成图像时出错: {str(e)}")
+        print(traceback.format_exc())
+        await interaction.followup.send(f"❌ 生成图像时出错: {str(e)}")
+
 @tree.command(name="naigen", description="使用NovelAI生成图像 (高级选项)")
 @app_commands.describe(
     prompt="图像生成提示词",
     model="选择模型",
     size="图像尺寸 (宽x高)",
-    steps="采样步数 (1-28)",  # 更新描述
+    steps="采样步数 (1-28)",
     scale="CFG比例 (1-10)",
     sampler="采样器",
     noise_schedule="噪声调度",
@@ -1060,7 +1438,7 @@ async def check_expired_keys():
     dynamic_smea="启用动态SMEA (仅v3模型)",
     cfg_rescale="CFG重缩放 (0-1)",
     seed="随机种子 (留空为随机)",
-    variety_plus="启用Variety+功能"  # 新增选项
+    variety_plus="启用Variety+功能"
 )
 @app_commands.choices(
     model=[
@@ -1094,7 +1472,7 @@ async def naigen_command(
     dynamic_smea: bool = True,
     cfg_rescale: float = DEFAULT_CFG_RESCALE,
     seed: str = None,
-    variety_plus: bool = False  # 新增参数
+    variety_plus: bool = False
 ):
     await interaction.response.defer(thinking=True)
     
@@ -1217,7 +1595,6 @@ async def naigen_command(
         embed.set_image(url="attachment://generated_image.png")
         embed.set_footer(text=f"由 {interaction.user.display_name} 生成")
         
-        # 不再显示参数细节，只含基本信息
         await interaction.followup.send(file=file, embed=embed)
         
     except Exception as e:
@@ -1225,11 +1602,88 @@ async def naigen_command(
         print(traceback.format_exc())
         await interaction.followup.send(f"❌ 生成图像时出错: {str(e)}")
 
-# 基础生成命令
-@tree.command(name="nai", description="使用NovelAI生成图像")
+@tree.command(name="naivariation", description="基于最近生成的图像创建变体")
 @app_commands.describe(
-    prompt="图像生成提示词",
-    model="模型选择"
+    index="要变化的图像索引(1为最近生成的)",
+    variation_type="变化类型",
+    additional_prompt="额外提示词(仅提示词增强模式使用)"
+)
+async def naivariation_command(
+    interaction: discord.Interaction, 
+    index: int = 1,
+    variation_type: Literal["轻微调整", "提示词增强"] = "轻微调整",
+    additional_prompt: str = ""
+):
+    await interaction.response.defer(thinking=True)
+    
+    user_id = str(interaction.user.id)
+    if user_id not in recent_generations or not recent_generations[user_id]:
+        await interaction.followup.send("❌ 没有找到最近的生成记录!", ephemeral=True)
+        return
+        
+    if index < 1 or index > len(recent_generations[user_id]):
+        await interaction.followup.send(f"❌ 索引超出范围，你只有 {len(recent_generations[user_id])} 条生成记录", ephemeral=True)
+        return
+    
+    # 复制原始生成参数
+    original_record = recent_generations[user_id][index-1]
+    new_payload = copy.deepcopy(original_record["payload"])
+    
+    if variation_type == "轻微调整":
+        # 微调参数但保持原始种子
+        params = new_payload["parameters"]
+        params["scale"] = min(10, params.get("scale", DEFAULT_SCALE) * random.uniform(0.9, 1.1))
+        params["steps"] = min(28, params.get("steps", DEFAULT_STEPS) + random.randint(-2, 2))
+    else:  # 提示词增强
+        if not additional_prompt:
+            await interaction.followup.send("❌ 提示词增强模式需要提供额外提示词", ephemeral=True)
+            return
+            
+        # 添加新提示词内容
+        original_prompt = new_payload.get("input", "")
+        new_payload["input"] = f"{original_prompt}, {additional_prompt}"
+        
+        # 对v4模型更新提示词结构
+        if "parameters" in new_payload and "v4_prompt" in new_payload["parameters"]:
+            v4_prompt = new_payload["parameters"]["v4_prompt"]
+            if "caption" in v4_prompt:
+                v4_prompt["caption"]["base_caption"] = f"{original_prompt}, {additional_prompt}"
+    
+    # 复用现有的API请求代码
+    api_key, provider_info = await get_api_key(interaction)
+    if not api_key:
+        return
+        
+    image_data = await send_novelai_request(api_key, new_payload, interaction)
+    if image_data is None:
+        return
+    
+    # 创建文件和嵌入消息
+    file = discord.File(io.BytesIO(image_data), filename="variation.png")
+    
+    embed = discord.Embed(title=f"图像变体 - {variation_type}", color=0xf75c7e)
+    embed.add_field(name="原始提示词", value=original_record["payload"].get("input", "")[:1024], inline=False)
+    
+    if variation_type == "提示词增强":
+        embed.add_field(name="添加的内容", value=additional_prompt, inline=False)
+        
+    embed.add_field(name="模型", value=new_payload.get("model", DEFAULT_MODEL), inline=True)
+    embed.add_field(name="种子", value=str(original_record["seed"]), inline=True)
+    
+    if provider_info:
+        embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
+        
+    embed.set_image(url="attachment://variation.png")
+    embed.set_footer(text=f"由 {interaction.user.display_name} 生成 | 变体")
+    
+    await interaction.followup.send(file=file, embed=embed)
+
+# ===== 批量生成命令 =====
+@tree.command(name="naibatch", description="提交批量图像生成请求")
+@app_commands.describe(
+    prompt="图像提示词模板，使用 {var1} {var2} 语法表示变量",
+    variations="变量值列表，格式: var1=值1,值2,值3|var2=值4,值5,值6",
+    model="选择模型"
 )
 @app_commands.choices(
     model=[
@@ -1237,64 +1691,674 @@ async def naigen_command(
         for model in AVAILABLE_MODELS
     ]
 )
-async def nai_command(
+async def naibatch_command(
     interaction: discord.Interaction, 
     prompt: str,
+    variations: str,
     model: str = None
 ):
+    # 复用API密钥获取和参数验证逻辑
+    await interaction.response.defer(thinking=True)
+    
+    api_key, provider_info = await get_api_key(interaction)
+    if not api_key:
+        return
+        
+    selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
+    
+    try:
+        # 解析变量定义
+        var_definitions = {}
+        for part in variations.split('|'):
+            if '=' not in part:
+                continue
+                
+            var_name, var_values = part.split('=', 1)
+            var_name = var_name.strip()
+            var_values = [v.strip() for v in var_values.split(',')]
+            var_definitions[var_name] = var_values
+            
+        # 生成所有可能的组合
+        import itertools
+        
+        vars_to_combine = []
+        var_names = []
+        
+        for var_name, values in var_definitions.items():
+            vars_to_combine.append(values)
+            var_names.append(var_name)
+            
+        combinations = list(itertools.product(*vars_to_combine))
+        
+        if len(combinations) > 10:
+            await interaction.followup.send(f"⚠️ 你定义了 {len(combinations)} 个组合，超过最大限制(10个)。只处理前10个。", ephemeral=True)
+            combinations = combinations[:10]
+            
+        # 准备批处理队列
+        batch_requests = []
+        
+        for i, combo in enumerate(combinations):
+            # 创建当前组合的提示词
+            current_prompt = prompt
+            for j, var_name in enumerate(var_names):
+                current_prompt = current_prompt.replace(f"{{{var_name}}}", combo[j])
+                
+            # 获取模型参数 - 复用现有函数
+            model_params = get_model_default_params(selected_model)
+            
+            # 准备API请求
+            payload = {
+                "input": current_prompt,
+                "model": selected_model,
+                "action": "generate",
+                "parameters": model_params
+            }
+            
+            # 创建批处理请求
+            batch_request = {
+                "interaction": interaction,
+                "api_key": api_key,
+                "payload": payload,
+                "provider_info": provider_info,
+                "is_batch": True,
+                "batch_index": i,
+                "batch_total": len(combinations)
+            }
+            
+            batch_requests.append(batch_request)
+            
+        # 创建或获取用户队列
+        user_id = str(interaction.user.id)
+        queue_id = f"user_{user_id}"
+        
+        if queue_id not in generation_queues:
+            generation_queues[queue_id] = {
+                "queue": [],
+                "processing": False,
+                "last_processed": None
+            }
+            
+        # 添加到队列
+        generation_queues[queue_id]["queue"].extend(batch_requests)
+        
+        await interaction.followup.send(
+            f"✅ 已将 {len(batch_requests)} 个批量生成请求添加到队列。\n"
+            f"• 提示词模板: {prompt}\n"
+            f"• 变量组合数: {len(combinations)}\n"
+            f"• 队列长度: {len(generation_queues[queue_id]['queue'])}",
+            ephemeral=True
+        )
+        
+    except Exception as e:
+        print(f"批量生成时出错: {str(e)}")
+        print(traceback.format_exc())
+        await interaction.followup.send(f"❌ 批量生成时出错: {str(e)}")
+
+# ===== 协作生成命令 =====
+@tree.command(name="relay", description="开始接力生成图像的协作会话")
+@app_commands.describe(
+    initial_prompt="初始提示词",
+    max_participants="最大参与人数",
+    duration_minutes="会话持续时间(分钟)"
+)
+async def relay_command(
+    interaction: discord.Interaction, 
+    initial_prompt: str, 
+    max_participants: int = 5, 
+    duration_minutes: int = 60
+):
+    await interaction.response.defer()
+    
+    # 检查是否在服务器中
+    guild_id = interaction.guild_id
+    if not guild_id:
+        await interaction.followup.send("❌ 此命令只能在服务器中使用。", ephemeral=True)
+        return
+        
+    # 获取API密钥 - 复用现有函数
+    api_key, provider_info = await get_api_key(interaction)
+    if not api_key:
+        return
+        
+    # 创建会话
+    session_id = f"relay_{guild_id}_{int(time.time())}"
+    expires_at = datetime.datetime.now() + datetime.timedelta(minutes=duration_minutes)
+    
+    relay_sessions[session_id] = {
+        "guild_id": str(guild_id),
+        "channel_id": str(interaction.channel_id),
+        "creator_id": str(interaction.user.id),
+        "participants": [str(interaction.user.id)],
+        "participant_names": [interaction.user.display_name],
+        "current_prompt": initial_prompt,
+        "max_participants": max_participants,
+        "expires_at": expires_at,
+        "is_completed": False,
+        "api_key": api_key,
+        "provider_info": provider_info
+    }
+    
+    # 创建嵌入消息
+    embed = discord.Embed(
+        title="🏆 图像生成接力",
+        description="多人协作完成一幅生成图像！",
+        color=0x3498db
+    )
+    
+    embed.add_field(name="💭 当前提示词", value=initial_prompt, inline=False)
+    embed.add_field(name="👥 已参与", value=f"1/{max_participants}: {interaction.user.display_name}", inline=True)
+    embed.add_field(name="⏰ 截止时间", value=f"<t:{int(expires_at.timestamp())}:R>", inline=True)
+    
+    # 使用共享视图类
+    view = RelayButtons(session_id, expires_at)
+    await interaction.followup.send(embed=embed, view=view)
+
+# 1. 修复添加内容后更新功能
+async def handle_relay_add_content(interaction, session_id):
+    """处理添加内容到接力会话的请求"""
+    # 注意：不要在这里使用defer，因为我们要发送模态窗口
+    
+    if session_id not in relay_sessions:
+        await interaction.response.send_message("❌ 此接力会话已不存在或已过期。", ephemeral=True)
+        return
+        
+    session = relay_sessions[session_id]
+    
+    # 检查会话是否已完成
+    if session["is_completed"]:
+        await interaction.response.send_message("❌ 此接力会话已完成。", ephemeral=True)
+        return
+        
+    # 检查是否已达到最大参与人数
+    user_id = str(interaction.user.id)
+    if len(session["participants"]) >= session["max_participants"] and user_id not in session["participants"]:
+        await interaction.response.send_message(f"❌ 此接力会话已达到最大参与人数 ({session['max_participants']})。", ephemeral=True)
+        return
+        
+    # 显示输入对话框
+    class AddContentModal(discord.ui.Modal, title="添加接力内容"):
+        content = discord.ui.TextInput(
+            label="添加到提示词", 
+            placeholder="输入你想要添加到提示词的内容...", 
+            min_length=1, 
+            max_length=200,
+            style=discord.TextStyle.paragraph
+        )
+
+        async def on_submit(self, modal_interaction):
+            await modal_interaction.response.defer(ephemeral=True)
+            
+            try:
+                # 更新会话内容
+                new_content = self.content.value.strip()
+                current_prompt = session["current_prompt"]
+                
+                # 添加新内容
+                updated_prompt = f"{current_prompt}, {new_content}"
+                session["current_prompt"] = updated_prompt
+                
+                # 添加参与者（如果是新参与者）
+                if user_id not in session["participants"]:
+                    session["participants"].append(user_id)
+                    session["participant_names"].append(interaction.user.display_name)
+                
+                try:
+                    # 更新原消息 - 简化并改进查找方式
+                    channel = client.get_channel(int(session["channel_id"]))
+                    if channel:
+                        embed = discord.Embed(
+                            title="🏆 图像生成接力",
+                            description="多人协作完成一幅生成图像！",
+                            color=0x3498db
+                        )
+                        
+                        embed.add_field(name="💭 当前提示词", value=updated_prompt, inline=False)
+                        embed.add_field(name="👥 已参与", 
+                                      value=f"{len(session['participant_names'])}/{session['max_participants']}: {', '.join(session['participant_names'])}", 
+                                      inline=True)
+                        embed.add_field(name="⏰ 截止时间", value=f"<t:{int(session['expires_at'].timestamp())}:R>", inline=True)
+                        
+                        # 更新消息，保留按钮
+                        view = RelayButtons(session_id, session["expires_at"])
+                        
+                        # 简化查找逻辑
+                        async for message in channel.history(limit=20):
+                            if message.author == client.user and message.embeds:
+                                for msg_embed in message.embeds:
+                                    if msg_embed.title == "🏆 图像生成接力":
+                                        await message.edit(embed=embed, view=view)
+                                        break
+                except Exception as update_error:
+                    print(f"更新消息时出错: {update_error}")
+                
+                await modal_interaction.followup.send(f"✅ 你已成功添加内容: \"{new_content}\"\n当前提示词: {updated_prompt}", ephemeral=True)
+            except Exception as e:
+                await modal_interaction.followup.send(f"❌ 添加内容时出错: {str(e)}", ephemeral=True)
+    
+    # 正确的方式：直接使用response.send_modal而不是followup.send_modal
+    await interaction.response.send_modal(AddContentModal())
+
+# 2. 修复完成接力功能 - 添加内容过滤和错误处理
+async def handle_relay_complete(interaction, session_id):
+    """完成接力会话并生成最终图像"""
+    await interaction.response.defer(thinking=True)
+    
+    if session_id not in relay_sessions:
+        await interaction.followup.send("❌ 此接力会话已不存在或已过期。", ephemeral=True)
+        return
+        
+    session = relay_sessions[session_id]
+    
+    # 检查会话是否已完成
+    if session["is_completed"]:
+        await interaction.followup.send("❌ 此接力会话已完成。", ephemeral=True)
+        return
+        
+    # 检查是否是参与者
+    user_id = str(interaction.user.id)
+    if user_id not in session["participants"]:
+        await interaction.followup.send("❌ 只有参与者可以完成接力会话。", ephemeral=True)
+        return
+    
+    # 标记会话为已完成
+    session["is_completed"] = True
+    
+    # 获取最终提示词
+    final_prompt = session["current_prompt"]
+    
+    # 使用API生成最终图像
+    api_key = session["api_key"]
+    provider_info = session["provider_info"]
+    
+    # 增强负面提示词以避免不适当内容
+    stronger_negative_prompt = DEFAULT_NEG_PROMPT + ", "
+    
+    # 获取适合模型的参数
+    selected_model = DEFAULT_MODEL
+    model_params = get_model_default_params(selected_model)
+    model_params["negative_prompt"] = stronger_negative_prompt
+    
+    # 准备API请求
+    payload = {
+        "input": final_prompt,
+        "model": selected_model,
+        "action": "generate",
+        "parameters": model_params
+    }
+    
+    try:
+        # 生成图像
+        image_data = await send_novelai_request(api_key, payload, interaction)
+        if image_data is None:
+            await interaction.followup.send("❌ 生成最终图像失败。请稍后重试。", ephemeral=False)
+            return
+        
+        # 创建文件对象并发送
+        file = discord.File(io.BytesIO(image_data), filename="relay_final.png")
+        
+        # 创建嵌入消息
+        embed = discord.Embed(
+            title="🎉 接力生成完成!",
+            description=f"由 {len(session['participants'])} 名成员共同创作",
+            color=0x2ecc71
+        )
+        
+        embed.add_field(name="📝 最终提示词", value=final_prompt, inline=False)
+        embed.add_field(name="👥 参与者", value=", ".join(session["participant_names"]), inline=False)
+        embed.add_field(name="🎨 模型", value=selected_model, inline=True)
+        
+        if provider_info:
+            embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
+            
+        embed.set_image(url="attachment://relay_final.png")
+        embed.set_footer(text=f"接力会话完成 • 由 {interaction.user.display_name} 确认完成")
+        
+        try:
+            await interaction.followup.send(file=file, embed=embed)
+        except discord.errors.HTTPException as http_error:
+            if "error code: 20009" in str(http_error):
+                # 处理不适当内容错误
+                await interaction.followup.send(
+                    "❌ Discord检测到生成的图像可能包含不适当内容，无法发送。\n"
+                    "请尝试使用不同的提示词或添加更多的负面提示词。\n"
+                    f"最终提示词为: {final_prompt}",
+                    ephemeral=False
+                )
+            else:
+                await interaction.followup.send(f"❌ 发送图像时出错: {http_error}", ephemeral=False)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 完成接力过程中出错: {str(e)}", ephemeral=False)
+    finally:
+        # 删除会话数据以释放内存
+        if session_id in relay_sessions:
+            del relay_sessions[session_id]
+
+async def handle_relay_complete(interaction, session_id):
+    """完成接力会话并生成最终图像"""
+    await interaction.response.defer()
+    
+    if session_id not in relay_sessions:
+        await interaction.followup.send("❌ 此接力会话已不存在或已过期。", ephemeral=True)
+        return
+        
+    session = relay_sessions[session_id]
+    
+    # 检查会话是否已完成
+    if session["is_completed"]:
+        await interaction.followup.send("❌ 此接力会话已完成。", ephemeral=True)
+        return
+        
+    # 检查是否是参与者
+    user_id = str(interaction.user.id)
+    if user_id not in session["participants"]:
+        await interaction.followup.send("❌ 只有参与者可以完成接力会话。", ephemeral=True)
+        return
+    
+    # 标记会话为已完成
+    session["is_completed"] = True
+    
+    # 获取最终提示词
+    final_prompt = session["current_prompt"]
+    
+    # 使用API生成最终图像
+    api_key = session["api_key"]
+    provider_info = session["provider_info"]
+    
+    # 获取适合模型的参数
+    selected_model = DEFAULT_MODEL
+    model_params = get_model_default_params(selected_model)
+    
+    # 准备API请求
+    payload = {
+        "input": final_prompt,
+        "model": selected_model,
+        "action": "generate",
+        "parameters": model_params
+    }
+    
+    # 生成图像
+    image_data = await send_novelai_request(api_key, payload, interaction)
+    if image_data is None:
+        await interaction.followup.send("❌ 生成最终图像失败。请稍后重试。", ephemeral=False)
+        return
+    
+    # 创建文件对象并发送
+    file = discord.File(io.BytesIO(image_data), filename="relay_final.png")
+    
+    # 创建嵌入消息
+    embed = discord.Embed(
+        title="🎉 接力生成完成!",
+        description=f"由 {len(session['participants'])} 名成员共同创作",
+        color=0x2ecc71
+    )
+    
+    embed.add_field(name="📝 最终提示词", value=final_prompt, inline=False)
+    embed.add_field(name="👥 参与者", value=", ".join(session["participant_names"]), inline=False)
+    embed.add_field(name="🎨 模型", value=selected_model, inline=True)
+    
+    if provider_info:
+        embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
+        
+    embed.set_image(url="attachment://relay_final.png")
+    embed.set_footer(text=f"接力会话完成 • 由 {interaction.user.display_name} 确认完成")
+    
+    await interaction.followup.send(file=file, embed=embed)
+    
+    # 删除会话数据以释放内存
+    if session_id in relay_sessions:
+        del relay_sessions[session_id]
+
+# ===== 状态和信息命令 =====
+@tree.command(name="checkapi", description="检查NovelAI API的可用性状态")
+async def checkapi_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    
+    try:
+        # 检查NovelAI网站连通性
+        site_response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.get("https://novelai.net/", timeout=10)
+        )
+        
+        if site_response.status_code == 200:
+            site_status = "✅ NovelAI网站可以访问，API可能正常工作。"
+        else:
+            site_status = f"⚠️ NovelAI网站返回了状态码 {site_response.status_code}，API可能存在问题。"
+    
+    except requests.exceptions.RequestException as e:
+        site_status = f"❌ 无法连接到NovelAI网站: {str(e)}"
+    
+    embed = discord.Embed(
+        title="NovelAI API 状态检查",
+        color=0xf75c7e
+    )
+    
+    embed.add_field(name="当前状态", value=site_status, inline=False)
+    embed.add_field(name="已知问题", 
+                   value="• v4模型可能返回500内部服务器错误\n• 如果遇到v4模型的500错误，建议尝试使用v3模型代替。", 
+                   inline=False)
+    
+    await interaction.followup.send(embed=embed)
+
+@tree.command(name="botstatus", description="检查机器人的当前状态和性能")
+async def botstatus_command(interaction: discord.Interaction):
+    # 延迟响应，告诉Discord我们需要更多时间
+    await interaction.response.defer()
+    
+    # 收集状态信息
+    total_keys = len(api_keys)
+    shared_keys_count = len([1 for key_data in api_keys.values() if key_data.get("shared_guilds")])
+    persistent_keys = len([1 for key_data in api_keys.values() if key_data.get("persist", False)])
+    
+    # 计算即将过期的密钥
+    soon_expire = 0
+    for key_data in api_keys.values():
+        if "expires_at" in key_data and key_data["expires_at"]:
+            time_left = (key_data["expires_at"] - datetime.datetime.now()).total_seconds()
+            if 0 < time_left < 24*3600:  # 24小时内过期
+                soon_expire += 1
+    
+    # 计算机器人运行时间 - 使用全局启动时间变量
+    current_time = datetime.datetime.now()
+    uptime = current_time - BOT_START_TIME
+    
+    days = uptime.days
+    hours, remainder = divmod(uptime.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{days}天 {hours}小时 {minutes}分钟 {seconds}秒"
+    
+    # 收集模板数据
+    templates_count = len(prompt_templates)
+    
+    # 收集队列数据
+    active_queues = len([q for q in generation_queues.values() if q["queue"]])
+    total_queued = sum(len(q["queue"]) for q in generation_queues.values())
+    
+    # 收集协作会话数据
+    active_relays = len([s for s in relay_sessions.values() if not s["is_completed"]])
+    
+    # 构建状态嵌入消息
+    embed = discord.Embed(
+        title="📊 NovelAI Bot 状态",
+        description="机器人当前运行状态和性能信息",
+        color=0x3498db
+    )
+    
+    embed.add_field(name="🤖 运行状态", value="✅ 正常运行中", inline=False)
+    embed.add_field(name="🔑 API密钥统计", 
+                   value=f"总数: {total_keys}\n共享密钥: {shared_keys_count}\n持久化密钥: {persistent_keys}\n即将过期: {soon_expire}", 
+                   inline=True)
+    embed.add_field(name="🗂️ 模板统计", 
+                   value=f"总数: {templates_count}", 
+                   inline=True)
+    embed.add_field(name="📋 队列统计", 
+                   value=f"活跃队列: {active_queues}\n等待任务: {total_queued}", 
+                   inline=True)
+    embed.add_field(name="👥 协作会话", 
+                   value=f"活跃接力: {active_relays}", 
+                   inline=True)
+    embed.add_field(name="📡 Discord连接", 
+                   value=f"延迟: {round(client.latency * 1000, 2)}ms", 
+                   inline=True)
+    embed.add_field(name="⏱️ 运行时间", 
+                   value=f"{uptime_str}", 
+                   inline=True)
+    
+    # NovelAI API状态检查结果
+    try:
+        # 简单检查NovelAI网站连通性
+        site_response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.get("https://novelai.net/", timeout=5)
+        )
+        
+        if site_response.status_code == 200:
+            api_status = "✅ 可用"
+        else:
+            api_status = f"⚠️ 状态码: {site_response.status_code}"
+    
+    except requests.exceptions.RequestException:
+        api_status = "❌ 连接失败"
+    
+    embed.add_field(name="🌐 NovelAI API", value=api_status, inline=False)
+    
+    # 添加版本信息和时间戳
+    embed.set_footer(text=f"Bot版本: {VERSION} • {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    await interaction.followup.send(embed=embed)
+
+# ===== GitHub 热更新功能 =====
+@tree.command(name="update", description="从GitHub更新机器人代码")
+@app_commands.describe(
+    branch="要拉取的分支名称",
+    force="是否强制更新，覆盖本地修改"
+)
+async def update_command(interaction: discord.Interaction, branch: str = "main", force: bool = False):
+    # 检查权限(只允许机器人管理员使用)
+    user_id = str(interaction.user.id)
+    
+    if not BOT_ADMIN_IDS or user_id not in BOT_ADMIN_IDS:
+        await interaction.response.send_message("❌ 你没有权限执行更新操作。", ephemeral=True)
+        return
+    
     await interaction.response.defer(thinking=True)
     
     try:
-        # 获取API密钥
-        api_key, provider_info = await get_api_key(interaction)
-        if not api_key:
+        # 检查git依赖
+        try:
+            import git
+        except ImportError:
+            await interaction.followup.send("❌ 未安装git模块。请先运行 `pip install gitpython`。")
             return
-        
-        # 验证并设置模型
-        selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
-        
-        # 获取适合模型的参数
-        model_params = get_model_default_params(selected_model)
-        
-        # 准备API请求
-        payload = {
-            "input": prompt,
-            "model": selected_model,
-            "action": "generate",
-            "parameters": model_params
-        }
-        
-        # 使用统一的API请求处理函数
-        image_data = await send_novelai_request(api_key, payload, interaction)
-        if image_data is None:
-            return  # 如果API请求失败，直接返回
-        
-        # 创建文件对象并发送
-        file = discord.File(io.BytesIO(image_data), filename="generated_image.png")
-        
-        # 创建基本嵌入消息
-        embed = discord.Embed(title="NovelAI 生成图像", color=0xf75c7e)
-        embed.add_field(name="提示词", value=prompt[:1024], inline=False)
-        embed.add_field(name="模型", value=selected_model, inline=True)
-        
-        # 如果使用的是共享密钥，显示提供者信息
-        if provider_info:
-            if provider_info == "自己的密钥":
-                embed.add_field(name="🔑 API密钥", value="使用自己的密钥", inline=True)
-            else:
-                embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
             
-        embed.set_image(url="attachment://generated_image.png")
-        embed.set_footer(text=f"由 {interaction.user.display_name} 生成")
+        # 检查是否是git仓库
+        try:
+            repo = git.Repo('.')
+        except git.exc.InvalidGitRepositoryError:
+            await interaction.followup.send("❌ 当前目录不是git仓库。")
+            return
+            
+        # 获取当前版本
+        current_commit = repo.head.commit
+        current_version = current_commit.hexsha[:7]
         
-        await interaction.followup.send(file=file, embed=embed)
+        # 检查远程分支
+        try:
+            origin = repo.remotes.origin
+            origin.fetch()
+            remote_branch = origin.refs[branch]
+        except Exception as e:
+            await interaction.followup.send(f"❌ 获取远程分支时出错: {str(e)}")
+            return
+            
+        # 获取远程版本
+        remote_commit = remote_branch.commit
+        remote_version = remote_commit.hexsha[:7]
+        
+        # 检查是否有更新
+        if current_commit.hexsha == remote_commit.hexsha:
+            await interaction.followup.send(f"✅ 已是最新版本 ({current_version})，无需更新。")
+            return
+            
+        # 显示更新信息
+        commits_between = list(repo.iter_commits(f"{current_commit.hexsha}..{remote_commit.hexsha}"))
+        update_info = "\n".join([f"• {commit.message.split('\n')[0]}" for commit in commits_between[:5]])
+        
+        if len(commits_between) > 5:
+            update_info += f"\n• ...以及另外 {len(commits_between) - 5} 条提交"
+            
+        # 备份当前状态
+        backup_path = f"backup_{int(time.time())}"
+        os.makedirs(backup_path, exist_ok=True)
+        
+        # 备份所有Python文件
+        for root, dirs, files in os.walk("."):
+            # 跳过备份目录
+            if root.startswith(f"./{backup_path}"):
+                continue
+                
+            # 跳过Git目录
+            if ".git" in root:
+                continue
+                
+            # 创建对应的备份目录结构
+            backup_dir = os.path.join(backup_path, root[2:])  # 去掉开头的 ./
+            os.makedirs(backup_dir, exist_ok=True)
+            
+            # 复制所有Python文件
+            for file in files:
+                if file.endswith(".py"):
+                    src_file = os.path.join(root, file)
+                    dst_file = os.path.join(backup_dir, file)
+                    shutil.copy2(src_file, dst_file)
+        
+        # 执行git操作
+        if force:
+            # 强制更新，丢弃本地修改
+            repo.git.reset('--hard', remote_branch.name)
+        else:
+            # 尝试合并更新
+            try:
+                repo.git.pull('origin', branch)
+            except git.GitCommandError as e:
+                await interaction.followup.send(
+                    f"❌ 拉取更新失败: {str(e)}\n\n"
+                    f"您可能有本地修改冲突。尝试使用 `--force` 参数进行强制更新。"
+                )
+                return
+                
+        # 检查依赖更新
+        try:
+            if os.path.exists("requirements.txt"):
+                os.system("pip install -r requirements.txt")
+        except Exception as e:
+            await interaction.followup.send(f"⚠️ 更新依赖时出现问题: {str(e)}")
+            
+        # 发送成功消息
+        success_message = (
+            f"✅ 更新成功!\n\n"
+            f"从 {current_version} 更新到 {remote_version}\n\n"
+            f"更新内容:\n{update_info}\n\n"
+            f"已在 {backup_path} 创建备份。\n"
+            f"将在10秒后重启机器人..."
+        )
+        
+        await interaction.followup.send(success_message)
+        
+        # 保存所有状态
+        save_api_keys_to_file()
+        save_templates_to_file()
+        
+        # 延迟后重启
+        await asyncio.sleep(10)
+        
+        # 重启程序
+        os.execv(sys.executable, ['python'] + sys.argv)
         
     except Exception as e:
-        print(f"生成图像时出错: {str(e)}")
-        print(traceback.format_exc())
-        await interaction.followup.send(f"❌ 生成图像时出错: {str(e)}")
+        await interaction.followup.send(f"❌ 更新过程中出错: {str(e)}\n{traceback.format_exc()}")
 
-# 帮助命令
+# ===== 帮助命令 =====
 @tree.command(name="help", description="显示帮助信息")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1304,70 +2368,59 @@ async def help_command(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="/apikey [key] [sharing] [duration_hours] [persist]",
+        name="🖼️ 图像生成命令",
         value=(
-            "注册你的NovelAI API密钥。\n"
-            "- `key`: 你的API密钥\n"
-            "- `sharing`: 设置为「服务器共享」或「私人使用」\n"
-            "- `duration_hours`: 密钥有效期(小时)，0表示永不过期\n"
-            "- `persist`: 是否在机器人重启后保存密钥（加密存储）"
+            "• `/nai [prompt] [model]` - 使用基础设置快速生成图像\n"
+            "• `/naigen [prompt] [options...]` - 使用高级设置生成图像\n"
+            "• `/naivariation [index] [type]` - 基于最近生成的图像创建变体\n"
+            "• `/naibatch [prompt] [variations]` - 批量生成多个变体图像\n"
+            "• `/relay [prompt]` - 开始一个接力生成协作会话"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="/nai [prompt] [model]",
+        name="📝 提示词模板",
         value=(
-            "使用基础设置快速生成图像。\n"
-            "- `prompt`: 图像提示词\n"
-            "- `model`: (可选)模型名称"
+            "• `/savetemplate [name] [prompt]` - 保存提示词模板\n"
+            "• `/listtemplates [filter_tags]` - 查看可用的提示词模板\n"
+            "• `/usetemplate [id]` - 使用模板生成图像\n"
+            "• `/deletetemplate [id]` - 删除你创建的模板"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="/naigen [prompt] [options...]",
+        name="🔑 API密钥管理",
         value=(
-            "使用高级设置生成图像，提供更多参数控制。\n"
-            "- 支持设置尺寸、步数、CFG比例、采样器等\n"
-            "- 可以设置随机种子以重现相同结果\n"
-            "- 支持启用Variety+功能增强创意多样性"
+            "• `/apikey [key] [sharing]` - 注册或管理API密钥\n"
+            "• `/sharedkeys` - 查看服务器共享的API密钥\n"
+            "• `/addsharing` - 在当前服务器共享你的密钥\n"
+            "• `/removesharing` - 停止在当前服务器共享\n"
+            "• `/deletekey` - 删除你注册的API密钥"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="密钥管理命令",
+        name="🔧 状态检查",
         value=(
-            "- `/sharedkeys`: 查看服务器共享的API密钥\n"
-            "- `/addsharing`: 在当前服务器共享你的密钥\n"
-            "- `/removesharing`: 停止在当前服务器共享\n"
-            "- `/deletekey`: 删除你注册的API密钥"
+            "• `/checkapi` - 检查NovelAI API状态\n"
+            "• `/botstatus` - 查看机器人运行状态和性能"
         ),
         inline=False
     )
     
     embed.add_field(
-        name="状态检查命令",
-        value=(
-            "- `/checkapi`: 检查NovelAI API状态\n"
-            "- `/botstatus`: 查看机器人运行状态和性能"
-        ),
-        inline=False
-    )
-    
-    embed.add_field(
-        name="模型兼容性说明",
-        value=(
-            "• v3模型 (nai-diffusion-3, nai-diffusion-3-furry): 支持SMEA和所有噪声调度\n"
-            "• v4模型 (nai-diffusion-4-full, nai-diffusion-4-curated): 不支持SMEA，推荐使用karras噪声调度"
-        ),
+        name="ℹ️ 关于版本",
+        value=f"版本: v{VERSION}\n"
+              f"有关最新更新和详细用法，请访问GitHub仓库。",
         inline=False
     )
     
     await interaction.response.send_message(embed=embed)
 
-# 主函数
+# ===== 主函数 =====
 if __name__ == "__main__":
     # 使用配置文件中的令牌，如果没有则尝试从环境变量获取
     TOKEN = DISCORD_TOKEN
