@@ -2,6 +2,8 @@
 .env
 config.txt
 api_keys.json
+prompt_templates.json
+
 
 # Python缓存文件
 __pycache__/
