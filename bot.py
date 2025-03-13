@@ -27,10 +27,12 @@ recent_generations = {}
 generation_queues = {}
 # 协作会话
 relay_sessions = {}
+# 用户批量任务状态
+batch_tasks = {}
 
 # 记录机器人启动时间和版本
 BOT_START_TIME = datetime.datetime.now()
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # ===== 配置管理 =====
 def read_config_file(file_path="config.txt"):
@@ -827,6 +829,58 @@ class RelayButtons(discord.ui.View):
         # 使用全局处理函数
         await handle_relay_complete(interaction, self.session_id)
 
+# ===== 批量任务管理 =====
+async def process_batch_task(task_id, user_id):
+    """处理批量任务队列"""
+    if task_id not in batch_tasks or user_id not in batch_tasks[task_id]:
+        return
+        
+    task = batch_tasks[task_id][user_id]
+    
+    # 如果任务已被取消，不处理
+    if task["status"] == "cancelled":
+        return
+        
+    # 更新状态为处理中
+    task["status"] = "processing"
+    task["current"] = 0
+    task["total"] = len(task["requests"])
+    
+    # 处理所有请求
+    for i, request in enumerate(task["requests"]):
+        # 如果任务被取消，提前退出
+        if task_id not in batch_tasks or user_id not in batch_tasks[task_id] or batch_tasks[task_id][user_id]["status"] == "cancelled":
+            break
+            
+        # 更新当前进度
+        task["current"] = i + 1
+        
+        try:
+            # 处理当前请求
+            await process_queued_request(request)
+            
+            # 添加延迟以避免过快发送
+            await asyncio.sleep(3)
+        except Exception as e:
+            print(f"批量任务 {task_id} 处理请求 {i+1}/{len(task['requests'])} 时出错: {str(e)}")
+            
+            # 尝试发送错误通知
+            try:
+                interaction = request.get("interaction")
+                await interaction.followup.send(f"❌ 批量生成 {i+1}/{len(task['requests'])} 失败: {str(e)}", ephemeral=True)
+            except:
+                pass
+    
+    # 完成任务，更新状态
+    if task_id in batch_tasks and user_id in batch_tasks[task_id]:
+        batch_tasks[task_id][user_id]["status"] = "completed"
+        batch_tasks[task_id][user_id]["completed_at"] = datetime.datetime.now()
+        
+        # 发送完成通知
+        interaction = task["requests"][0].get("interaction")
+        if interaction:
+            await interaction.followup.send(f"✅ 批量任务 `{task_id}` 已完成，成功生成 {task['current']}/{task['total']} 张图像。", ephemeral=True)
+
 # ===== 机器人初始化 =====
 @client.event
 async def on_ready():
@@ -858,6 +912,11 @@ async def on_ready():
     relay_sessions = {}
     client.loop.create_task(cleanup_expired_sessions())
     print("协作生成系统已初始化")
+    
+    # 初始化批量任务系统
+    global batch_tasks
+    batch_tasks = {}
+    print("批量任务系统已初始化")
     
     # 启动各种后台任务
     client.loop.create_task(check_expired_keys())  # 密钥过期检查
@@ -1118,29 +1177,74 @@ async def sharedkeys_command(interaction: discord.Interaction):
     name="模板名称",
     prompt="提示词内容",
     sharing="设置模板是否在此服务器共享",
-    tags="标签，用逗号分隔（例如: 风景,动漫）"
+    tags="标签，用逗号分隔（例如: 风景,动漫）",
+    save_params="是否保存高级参数设置"
 )
 async def savetemplate_command(
     interaction: discord.Interaction, 
     name: str, 
     prompt: str, 
     sharing: Literal["私人使用", "服务器共享"] = "私人使用",
-    tags: str = ""
+    tags: str = "",
+    save_params: bool = False
 ):
     user_id = str(interaction.user.id)
     template_id = f"{user_id}_{int(time.time())}"
     guild_id = interaction.guild_id if interaction.guild_id and sharing == "服务器共享" else None
     
     # 保存模板信息
-    prompt_templates[template_id] = {
+    template_data = {
         "name": name,
         "prompt": prompt,
         "creator_id": user_id,
         "creator_name": interaction.user.display_name,
         "shared_guilds": [guild_id] if guild_id else [],
         "tags": [tag.strip() for tag in tags.split(",") if tag.strip()],
-        "created_at": datetime.datetime.now().isoformat()
+        "created_at": datetime.datetime.now()
     }
+    
+    # 如果选择保存高级参数
+    if save_params:
+        # 获取用户最近的生成记录来提取参数
+        has_recent_params = False
+        if user_id in recent_generations and recent_generations[user_id]:
+            latest_record = recent_generations[user_id][0]
+            if "payload" in latest_record:
+                params = latest_record["payload"].get("parameters", {})
+                if params:
+                    model = latest_record["payload"].get("model", DEFAULT_MODEL)
+                    template_data["model"] = model
+                    template_data["params"] = {
+                        "width": params.get("width", DEFAULT_SIZE[0]),
+                        "height": params.get("height", DEFAULT_SIZE[1]),
+                        "scale": params.get("scale", DEFAULT_SCALE),
+                        "sampler": params.get("sampler", DEFAULT_SAMPLER),
+                        "steps": params.get("steps", DEFAULT_STEPS),
+                        "noise_schedule": params.get("noise_schedule", DEFAULT_NOISE_SCHEDULE),
+                        "cfg_rescale": params.get("cfg_rescale", DEFAULT_CFG_RESCALE),
+                        "sm": params.get("sm", True),
+                        "sm_dyn": params.get("sm_dyn", True),
+                        "negative_prompt": params.get("negative_prompt", DEFAULT_NEG_PROMPT)
+                    }
+                    has_recent_params = True
+        
+        if not has_recent_params:
+            # 使用默认参数
+            template_data["model"] = DEFAULT_MODEL
+            template_data["params"] = {
+                "width": DEFAULT_SIZE[0],
+                "height": DEFAULT_SIZE[1],
+                "scale": DEFAULT_SCALE,
+                "sampler": DEFAULT_SAMPLER,
+                "steps": DEFAULT_STEPS,
+                "noise_schedule": DEFAULT_NOISE_SCHEDULE,
+                "cfg_rescale": DEFAULT_CFG_RESCALE,
+                "sm": True,
+                "sm_dyn": True,
+                "negative_prompt": DEFAULT_NEG_PROMPT
+            }
+    
+    prompt_templates[template_id] = template_data
     
     # 保存模板
     save_templates_to_file()
@@ -1149,13 +1253,18 @@ async def savetemplate_command(
     sharing_text = "仅限你个人使用" if not guild_id else f"在此服务器共享使用"
     tags_text = tags if tags else "无"
     
+    # 添加参数信息
+    params_text = "已保存（包含当前生成设置）" if save_params else "未保存（仅保存提示词）"
+    
     await interaction.response.send_message(
         f"✅ 提示词模板 \"{name}\" 已保存！\n"
         f"• 提示词: {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n"
         f"• 共享设置: {sharing_text}\n"
         f"• 标签: {tags_text}\n"
+        f"• 高级参数: {params_text}\n"
         f"• 模板ID: {template_id}\n\n"
-        f"使用 `/usetemplate {template_id}` 来使用此模板生成图像。",
+        f"使用 `/usetemplate {template_id}` 来基于此模板生成图像，\n"
+        f"或在其他生成命令中使用 `template_id={template_id}` 参数引用此模板。",
         ephemeral=True
     )
 
@@ -1196,6 +1305,7 @@ async def listtemplates_command(
                 "name": template.get("name", "未命名模板"),
                 "creator": template.get("creator_name", "未知创建者"),
                 "tags": template.get("tags", []),
+                "has_params": "params" in template,
                 "is_creator": is_creator,
                 "is_shared": is_guild_shared
             }
@@ -1226,17 +1336,22 @@ async def listtemplates_command(
     for i, template in enumerate(available_templates, 1):
         tags_display = ", ".join(template["tags"]) if template["tags"] else "无标签"
         source_display = "✓ 你创建的" if template["is_creator"] else "👥 服务器共享" if template["is_shared"] else "🌐 全局共享"
+        params_display = "🔧 包含参数设置" if template["has_params"] else "📝 仅含提示词"
         
         embed.add_field(
             name=f"{i}. {template['name']}",
-            value=f"ID: `{template['id']}`\n创建者: {template['creator']}\n标签: {tags_display}\n{source_display}",
+            value=f"ID: `{template['id']}`\n创建者: {template['creator']}\n标签: {tags_display}\n{source_display}\n{params_display}",
             inline=i % 2 == 1  # 交替布局
         )
     
     # 显示用法信息
     embed.add_field(
         name="使用方法",
-        value="使用 `/usetemplate [模板ID]` 来应用模板生成图像。\n例如: `/usetemplate " + available_templates[0]["id"] + "`",
+        value=(
+            "• 单独使用: `/usetemplate [模板ID]`\n"
+            "• 与高级生成结合: `/naigen template_id=[模板ID] [其他参数]`\n"
+            "• 与批量生成结合: `/naibatch template_id=[模板ID] [变量定义]`"
+        ),
         inline=False
     )
     
@@ -1245,7 +1360,9 @@ async def listtemplates_command(
 @tree.command(name="usetemplate", description="使用提示词模板生成图像")
 @app_commands.describe(
     template_id="模板ID（从 /listtemplates 获取）",
-    model="选择模型"
+    model="选择模型（可覆盖模板中的模型设置）",
+    override_prompt="额外添加到提示词的内容（可选）",
+    use_params="是否使用模板中保存的参数设置"
 )
 @app_commands.choices(
     model=[
@@ -1256,7 +1373,9 @@ async def listtemplates_command(
 async def usetemplate_command(
     interaction: discord.Interaction, 
     template_id: str,
-    model: str = None
+    model: str = None,
+    override_prompt: str = "",
+    use_params: bool = True
 ):
     await interaction.response.defer(thinking=True)
     
@@ -1288,11 +1407,30 @@ async def usetemplate_command(
         await interaction.followup.send("❌ 此模板不包含有效的提示词。", ephemeral=True)
         return
     
-    # 验证并设置模型
-    selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
+    # 添加额外提示词
+    if override_prompt:
+        prompt = f"{prompt}, {override_prompt}"
     
-    # 获取适合模型的参数
-    model_params = get_model_default_params(selected_model)
+    # 准备参数
+    selected_model = model if model else template.get("model", DEFAULT_MODEL)
+    
+    # 获取参数 - 根据用户选择使用模板参数或默认参数
+    model_params = None
+    if use_params and "params" in template:
+        model_params = template["params"].copy()
+        # 确保参数兼容选中的模型
+        if model and model.startswith("nai-diffusion-4") and not selected_model.startswith("nai-diffusion-4"):
+            # 调整参数以适应v4模型
+            model_params["sm"] = False
+            model_params["sm_dyn"] = False
+            if model_params.get("noise_schedule") == "native":
+                model_params["noise_schedule"] = "karras"
+        elif model and not model.startswith("nai-diffusion-4") and selected_model.startswith("nai-diffusion-4"):
+            # 调整参数以适应v3模型
+            model_params["sm"] = True
+            model_params["sm_dyn"] = True
+    else:
+        model_params = get_model_default_params(selected_model)
     
     # 准备API请求
     payload = {
@@ -1314,6 +1452,14 @@ async def usetemplate_command(
     embed = discord.Embed(title=f"模板生成: {template.get('name')}", color=0x3498db)
     embed.add_field(name="提示词", value=prompt[:1024], inline=False)
     embed.add_field(name="模型", value=selected_model, inline=True)
+    
+    # 显示关键参数
+    param_text = []
+    if model_params:
+        param_text.append(f"尺寸: {model_params.get('width', DEFAULT_SIZE[0])}x{model_params.get('height', DEFAULT_SIZE[1])}")
+        param_text.append(f"采样器: {model_params.get('sampler', DEFAULT_SAMPLER)}")
+    embed.add_field(name="参数", value="\n".join(param_text) if param_text else "使用默认参数", inline=True)
+    
     embed.add_field(name="模板创建者", value=template.get("creator_name", "未知"), inline=True)
     
     if template.get("tags"):
@@ -1355,11 +1501,96 @@ async def deletetemplate_command(interaction: discord.Interaction, template_id: 
     
     await interaction.response.send_message(f"✅ 已删除模板 \"{template_name}\"。", ephemeral=True)
 
+@tree.command(name="updatetemplate", description="更新现有模板的参数")
+@app_commands.describe(
+    template_id="要更新的模板ID",
+    new_name="新的模板名称（可选）",
+    new_prompt="新的提示词（可选）",
+    new_tags="新的标签（用逗号分隔）（可选）",
+    update_params="是否更新为最近一次生成的参数"
+)
+async def updatetemplate_command(
+    interaction: discord.Interaction, 
+    template_id: str,
+    new_name: str = None,
+    new_prompt: str = None,
+    new_tags: str = None,
+    update_params: bool = False
+):
+    user_id = str(interaction.user.id)
+    
+    # 检查模板是否存在
+    if template_id not in prompt_templates:
+        await interaction.response.send_message("❌ 未找到指定的模板。", ephemeral=True)
+        return
+    
+    # 检查是否是创建者
+    template = prompt_templates[template_id]
+    if template.get("creator_id") != user_id:
+        await interaction.response.send_message("❌ 你不是此模板的创建者，无法更新。", ephemeral=True)
+        return
+    
+    # 更新模板
+    if new_name:
+        template["name"] = new_name
+    
+    if new_prompt:
+        template["prompt"] = new_prompt
+    
+    if new_tags:
+        template["tags"] = [tag.strip() for tag in new_tags.split(",") if tag.strip()]
+    
+    # 更新参数
+    if update_params:
+        # 检查是否有最近的生成记录
+        if user_id in recent_generations and recent_generations[user_id]:
+            latest_record = recent_generations[user_id][0]
+            if "payload" in latest_record:
+                model = latest_record["payload"].get("model", DEFAULT_MODEL)
+                params = latest_record["payload"].get("parameters", {})
+                
+                template["model"] = model
+                template["params"] = {
+                    "width": params.get("width", DEFAULT_SIZE[0]),
+                    "height": params.get("height", DEFAULT_SIZE[1]),
+                    "scale": params.get("scale", DEFAULT_SCALE),
+                    "sampler": params.get("sampler", DEFAULT_SAMPLER),
+                    "steps": params.get("steps", DEFAULT_STEPS),
+                    "noise_schedule": params.get("noise_schedule", DEFAULT_NOISE_SCHEDULE),
+                    "cfg_rescale": params.get("cfg_rescale", DEFAULT_CFG_RESCALE),
+                    "sm": params.get("sm", True),
+                    "sm_dyn": params.get("sm_dyn", True),
+                    "negative_prompt": params.get("negative_prompt", DEFAULT_NEG_PROMPT)
+                }
+        else:
+            await interaction.response.send_message("⚠️ 没有找到最近的生成记录，参数未更新。", ephemeral=True)
+            return
+    
+    # 保存更新
+    save_templates_to_file()
+    
+    # 构建更新摘要
+    update_summary = []
+    if new_name:
+        update_summary.append(f"• 名称: {new_name}")
+    if new_prompt:
+        update_summary.append(f"• 提示词: {new_prompt[:50]}..." if len(new_prompt) > 50 else f"• 提示词: {new_prompt}")
+    if new_tags:
+        update_summary.append(f"• 标签: {new_tags}")
+    if update_params:
+        update_summary.append("• 参数: 已更新为最近一次生成的参数")
+    
+    await interaction.response.send_message(
+        f"✅ 模板 \"{template['name']}\" 已更新！\n\n" + "\n".join(update_summary),
+        ephemeral=True
+    )
+
 # ===== 图像生成命令 =====
 @tree.command(name="nai", description="使用NovelAI生成图像")
 @app_commands.describe(
     prompt="图像生成提示词",
-    model="模型选择"
+    model="模型选择",
+    template_id="要使用的模板ID（可选）"
 )
 @app_commands.choices(
     model=[
@@ -1369,8 +1600,9 @@ async def deletetemplate_command(interaction: discord.Interaction, template_id: 
 )
 async def nai_command(
     interaction: discord.Interaction, 
-    prompt: str,
-    model: str = None
+    prompt: str = None,
+    model: str = None,
+    template_id: str = None
 ):
     await interaction.response.defer(thinking=True)
     
@@ -1380,11 +1612,59 @@ async def nai_command(
         if not api_key:
             return
         
+        # 处理模板
+        if template_id:
+            if template_id not in prompt_templates:
+                await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+                return
+                
+            template = prompt_templates[template_id]
+            user_id = str(interaction.user.id)
+            guild_id = interaction.guild_id
+            
+            # 检查访问权限
+            is_creator = template.get("creator_id") == user_id
+            is_guild_shared = guild_id in template.get("shared_guilds", [])
+            
+            if not (is_creator or is_guild_shared):
+                await interaction.followup.send("❌ 你没有权限使用此模板。", ephemeral=True)
+                return
+                
+            # 如果未提供提示词，使用模板提示词
+            if not prompt:
+                prompt = template.get("prompt", "")
+            else:
+                # 如果提供了提示词，与模板提示词组合
+                base_prompt = template.get("prompt", "")
+                prompt = f"{base_prompt}, {prompt}"
+                
+            # 如果未指定模型，使用模板模型
+            if not model and "model" in template:
+                model = template["model"]
+        
+        # 确保有提示词
+        if not prompt:
+            await interaction.followup.send("❌ 必须提供提示词或有效的模板。", ephemeral=True)
+            return
+        
         # 验证并设置模型
         selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
         
         # 获取适合模型的参数
-        model_params = get_model_default_params(selected_model)
+        model_params = None
+        if template_id and template_id in prompt_templates and "params" in prompt_templates[template_id]:
+            # 使用模板参数
+            model_params = prompt_templates[template_id]["params"].copy()
+            
+            # 调整参数以适应选中的模型
+            if model and selected_model.startswith("nai-diffusion-4"):
+                model_params["sm"] = False
+                model_params["sm_dyn"] = False
+                if model_params.get("noise_schedule") == "native":
+                    model_params["noise_schedule"] = "karras"
+        else:
+            # 使用默认参数
+            model_params = get_model_default_params(selected_model)
         
         # 准备API请求
         payload = {
@@ -1406,6 +1686,19 @@ async def nai_command(
         embed = discord.Embed(title="NovelAI 生成图像", color=0xf75c7e)
         embed.add_field(name="提示词", value=prompt[:1024], inline=False)
         embed.add_field(name="模型", value=selected_model, inline=True)
+        
+        # 如果使用模板，显示模板信息
+        if template_id and template_id in prompt_templates:
+            template_name = prompt_templates[template_id].get("name", "未命名模板")
+            embed.add_field(name="使用模板", value=template_name, inline=True)
+        
+        # 显示参数
+        param_text = []
+        if model_params:
+            param_text.append(f"尺寸: {model_params.get('width', DEFAULT_SIZE[0])}x{model_params.get('height', DEFAULT_SIZE[1])}")
+            param_text.append(f"采样器: {model_params.get('sampler', DEFAULT_SAMPLER)}")
+        if param_text:
+            embed.add_field(name="参数", value="\n".join(param_text), inline=True)
         
         # 如果使用的是共享密钥，显示提供者信息
         if provider_info:
@@ -1438,7 +1731,8 @@ async def nai_command(
     dynamic_smea="启用动态SMEA (仅v3模型)",
     cfg_rescale="CFG重缩放 (0-1)",
     seed="随机种子 (留空为随机)",
-    variety_plus="启用Variety+功能"
+    variety_plus="启用Variety+功能",
+    template_id="要使用的模板ID (可选，可与其他参数结合)"
 )
 @app_commands.choices(
     model=[
@@ -1460,19 +1754,20 @@ async def nai_command(
 )
 async def naigen_command(
     interaction: discord.Interaction, 
-    prompt: str,
-    model: str = DEFAULT_MODEL,
+    prompt: str = None,
+    model: str = None,
     size: str = None,
-    steps: int = DEFAULT_STEPS,
-    scale: float = DEFAULT_SCALE,
-    sampler: str = DEFAULT_SAMPLER,
+    steps: int = None,
+    scale: float = None,
+    sampler: str = None,
     noise_schedule: str = None,
     negative_prompt: str = None,
-    smea: bool = True,
-    dynamic_smea: bool = True,
-    cfg_rescale: float = DEFAULT_CFG_RESCALE,
+    smea: bool = None,
+    dynamic_smea: bool = None,
+    cfg_rescale: float = None,
     seed: str = None,
-    variety_plus: bool = False
+    variety_plus: bool = None,
+    template_id: str = None
 ):
     await interaction.response.defer(thinking=True)
     
@@ -1482,6 +1777,55 @@ async def naigen_command(
         if not api_key:
             return
         
+        # 处理模板
+        template_params = {}
+        template_model = None
+        template_prompt = None
+        
+        if template_id:
+            if template_id not in prompt_templates:
+                await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+                return
+                
+            template = prompt_templates[template_id]
+            user_id = str(interaction.user.id)
+            guild_id = interaction.guild_id
+            
+            # 检查访问权限
+            is_creator = template.get("creator_id") == user_id
+            is_guild_shared = guild_id in template.get("shared_guilds", [])
+            
+            if not (is_creator or is_guild_shared):
+                await interaction.followup.send("❌ 你没有权限使用此模板。", ephemeral=True)
+                return
+                
+            # 获取模板参数
+            if "params" in template:
+                template_params = template["params"]
+            
+            # 获取模板模型
+            if "model" in template:
+                template_model = template["model"]
+                
+            # 获取模板提示词
+            template_prompt = template.get("prompt", "")
+            
+            # 如果未提供提示词，使用模板提示词
+            if not prompt:
+                prompt = template_prompt
+            else:
+                # 如果提供了提示词，与模板提示词组合
+                prompt = f"{template_prompt}, {prompt}"
+        
+        # 确保有提示词
+        if not prompt:
+            await interaction.followup.send("❌ 必须提供提示词或有效的模板。", ephemeral=True)
+            return
+        
+        # 用用户提供的参数覆盖模板参数
+        # 选择模型的优先级：用户指定 > 模板指定 > 默认
+        selected_model = model if model else template_model if template_model else DEFAULT_MODEL
+        
         # 处理尺寸
         width, height = DEFAULT_SIZE
         if size:
@@ -1489,26 +1833,63 @@ async def naigen_command(
                 width, height = map(int, size.split('x'))
             except:
                 pass
+        elif "width" in template_params and "height" in template_params:
+            width = template_params["width"]
+            height = template_params["height"]
         
         # 确保步数在合理范围内 - 限制最大28步
-        steps = max(1, min(28, steps))
+        if steps is not None:
+            steps = max(1, min(28, steps))
+        elif "steps" in template_params:
+            steps = template_params["steps"]
+        else:
+            steps = DEFAULT_STEPS
         
         # 确保CFG比例在合理范围内
-        scale = max(1.0, min(10.0, scale))
+        if scale is not None:
+            scale = max(1.0, min(10.0, scale))
+        elif "scale" in template_params:
+            scale = template_params["scale"]
+        else:
+            scale = DEFAULT_SCALE
         
         # 确保CFG重缩放在合理范围内
-        cfg_rescale = max(0.0, min(1.0, cfg_rescale))
+        if cfg_rescale is not None:
+            cfg_rescale = max(0.0, min(1.0, cfg_rescale))
+        elif "cfg_rescale" in template_params:
+            cfg_rescale = template_params["cfg_rescale"]
+        else:
+            cfg_rescale = DEFAULT_CFG_RESCALE
+        
+        # 处理采样器
+        if not sampler:
+            sampler = template_params.get("sampler", DEFAULT_SAMPLER)
         
         # 处理噪声调度，为v4模型自动调整
         if not noise_schedule:
-            noise_schedule = "karras" if model.startswith("nai-diffusion-4") else DEFAULT_NOISE_SCHEDULE
-        elif noise_schedule == "native" and model.startswith("nai-diffusion-4"):
+            if "noise_schedule" in template_params:
+                noise_schedule = template_params["noise_schedule"]
+            else:
+                noise_schedule = "karras" if selected_model.startswith("nai-diffusion-4") else DEFAULT_NOISE_SCHEDULE
+        elif noise_schedule == "native" and selected_model.startswith("nai-diffusion-4"):
             noise_schedule = "karras"  # v4不支持native，自动切换为karras
         
+        # 处理负面提示词
+        if not negative_prompt:
+            negative_prompt = template_params.get("negative_prompt", DEFAULT_NEG_PROMPT)
+        
         # 处理SMEA设置
-        if model.startswith("nai-diffusion-4"):
-            smea = False
-            dynamic_smea = False
+        if smea is None:
+            if selected_model.startswith("nai-diffusion-4"):
+                smea = False
+            else:
+                smea = template_params.get("sm", True)
+                
+        if dynamic_smea is None:
+            if selected_model.startswith("nai-diffusion-4"):
+                dynamic_smea = False
+            else:
+                dynamic_smea = template_params.get("sm_dyn", True)
         
         # 处理随机种子
         random_seed = True
@@ -1539,7 +1920,7 @@ async def naigen_command(
             "n_samples": 1,
             "ucPreset": 0,
             "qualityToggle": True,
-            "negative_prompt": negative_prompt or DEFAULT_NEG_PROMPT,
+            "negative_prompt": negative_prompt,
             "cfg_rescale": cfg_rescale,
             "noise_schedule": noise_schedule,
             "sm": smea,
@@ -1552,14 +1933,14 @@ async def naigen_command(
             model_params["skip_cfg_above_sigma"] = skip_cfg_above_sigma
         
         # 添加v4特定参数
-        if model.startswith("nai-diffusion-4"):
+        if selected_model.startswith("nai-diffusion-4"):
             model_params["params_version"] = 3
             model_params["use_coords"] = True
         
         # 准备API请求
         payload = {
             "input": prompt,
-            "model": model,
+            "model": selected_model,
             "action": "generate",
             "parameters": model_params
         }
@@ -1575,7 +1956,7 @@ async def naigen_command(
         # 创建嵌入消息
         embed = discord.Embed(title="NovelAI 高级生成", color=0xf75c7e)
         embed.add_field(name="提示词", value=prompt[:1024], inline=False)
-        embed.add_field(name="模型", value=model, inline=True)
+        embed.add_field(name="模型", value=selected_model, inline=True)
         embed.add_field(name="尺寸", value=f"{width}x{height}", inline=True)
         
         # 显示种子值和Variety+状态
@@ -1584,6 +1965,11 @@ async def naigen_command(
         
         if variety_plus:
             embed.add_field(name="Variety+", value="已启用", inline=True)
+        
+        # 如果使用模板，显示模板信息
+        if template_id and template_id in prompt_templates:
+            template_name = prompt_templates[template_id].get("name", "未命名模板")
+            embed.add_field(name="使用模板", value=template_name, inline=True)
         
         # 如果使用的是共享密钥，显示提供者信息
         if provider_info:
@@ -1683,7 +2069,9 @@ async def naivariation_command(
 @app_commands.describe(
     prompt="图像提示词模板，使用 {var1} {var2} 语法表示变量",
     variations="变量值列表，格式: var1=值1,值2,值3|var2=值4,值5,值6",
-    model="选择模型"
+    param_variations="参数变化，格式: model=模型1,模型2|size=832x1216,1024x1024",
+    model="默认使用的模型（如不在param_variations中指定）",
+    template_id="要作为基础的模板ID（可选）"
 )
 @app_commands.choices(
     model=[
@@ -1693,9 +2081,11 @@ async def naivariation_command(
 )
 async def naibatch_command(
     interaction: discord.Interaction, 
-    prompt: str,
-    variations: str,
-    model: str = None
+    prompt: str = None,
+    variations: str = "",
+    param_variations: str = "",
+    model: str = None,
+    template_id: str = None
 ):
     # 复用API密钥获取和参数验证逻辑
     await interaction.response.defer(thinking=True)
@@ -1703,9 +2093,55 @@ async def naibatch_command(
     api_key, provider_info = await get_api_key(interaction)
     if not api_key:
         return
-        
-    selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
     
+    # 处理模板
+    template_params = {}
+    template_model = None
+    template_prompt = None
+    
+    if template_id:
+        if template_id not in prompt_templates:
+            await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+            return
+            
+        template = prompt_templates[template_id]
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild_id
+        
+        # 检查访问权限
+        is_creator = template.get("creator_id") == user_id
+        is_guild_shared = guild_id in template.get("shared_guilds", [])
+        
+        if not (is_creator or is_guild_shared):
+            await interaction.followup.send("❌ 你没有权限使用此模板。", ephemeral=True)
+            return
+            
+        # 获取模板参数
+        if "params" in template:
+            template_params = template["params"]
+        
+        # 获取模板模型
+        if "model" in template:
+            template_model = template["model"]
+            
+        # 获取模板提示词
+        template_prompt = template.get("prompt", "")
+        
+        # 如果未提供提示词，使用模板提示词
+        if not prompt:
+            prompt = template_prompt
+        elif template_prompt:
+            # 如果提供了提示词，与模板提示词组合
+            prompt = f"{template_prompt}, {prompt}"
+    
+    # 确保有提示词
+    if not prompt:
+        await interaction.followup.send("❌ 必须提供提示词或有效的模板。", ephemeral=True)
+        return
+    
+    # 选择模型的优先级：用户指定 > 模板指定 > 默认
+    selected_model = model if model else template_model if template_model else DEFAULT_MODEL
+        
     try:
         # 解析变量定义
         var_definitions = {}
@@ -1717,75 +2153,170 @@ async def naibatch_command(
             var_name = var_name.strip()
             var_values = [v.strip() for v in var_values.split(',')]
             var_definitions[var_name] = var_values
-            
+        
+        # 解析参数变化
+        param_var_definitions = {}
+        if param_variations:
+            for part in param_variations.split('|'):
+                if '=' not in part:
+                    continue
+                    
+                param_name, param_values = part.split('=', 1)
+                param_name = param_name.strip().lower()
+                param_values = [v.strip() for v in param_values.split(',')]
+                param_var_definitions[param_name] = param_values
+        
         # 生成所有可能的组合
         import itertools
         
-        vars_to_combine = []
-        var_names = []
+        # 提示词变量组合
+        prompt_vars_to_combine = []
+        prompt_var_names = []
         
         for var_name, values in var_definitions.items():
-            vars_to_combine.append(values)
-            var_names.append(var_name)
+            prompt_vars_to_combine.append(values)
+            prompt_var_names.append(var_name)
             
-        combinations = list(itertools.product(*vars_to_combine))
+        prompt_combinations = list(itertools.product(*prompt_vars_to_combine)) if prompt_vars_to_combine else [tuple()]
         
-        if len(combinations) > 10:
-            await interaction.followup.send(f"⚠️ 你定义了 {len(combinations)} 个组合，超过最大限制(10个)。只处理前10个。", ephemeral=True)
-            combinations = combinations[:10]
+        # 参数变量组合
+        param_vars_to_combine = []
+        param_var_names = []
+        
+        for param_name, values in param_var_definitions.items():
+            param_vars_to_combine.append(values)
+            param_var_names.append(param_name)
+            
+        param_combinations = list(itertools.product(*param_vars_to_combine)) if param_vars_to_combine else [tuple()]
+        
+        # 计算总组合数
+        total_combinations = len(prompt_combinations) * len(param_combinations)
+        
+        if total_combinations > 20:
+            await interaction.followup.send(f"⚠️ 你定义了 {total_combinations} 个组合，超过最大限制(20个)。只处理前20个。", ephemeral=True)
+            # 限制组合数，优先保持提示词变量的多样性
+            if len(prompt_combinations) > 20:
+                prompt_combinations = prompt_combinations[:20]
+                total_combinations = len(prompt_combinations)
+            else:
+                max_param_combinations = 20 // len(prompt_combinations)
+                param_combinations = param_combinations[:max_param_combinations]
+                total_combinations = len(prompt_combinations) * len(param_combinations)
+        
+        # 创建批量任务ID
+        task_id = f"batch_{int(time.time())}"
+        user_id = str(interaction.user.id)
+        
+        if task_id not in batch_tasks:
+            batch_tasks[task_id] = {}
             
         # 准备批处理队列
         batch_requests = []
         
-        for i, combo in enumerate(combinations):
+        # 生成所有组合的请求
+        for prompt_idx, prompt_combo in enumerate(prompt_combinations):
             # 创建当前组合的提示词
             current_prompt = prompt
-            for j, var_name in enumerate(var_names):
-                current_prompt = current_prompt.replace(f"{{{var_name}}}", combo[j])
+            for j, var_name in enumerate(prompt_var_names):
+                if j < len(prompt_combo):  # 确保索引有效
+                    current_prompt = current_prompt.replace(f"{{{var_name}}}", prompt_combo[j])
+            
+            for param_idx, param_combo in enumerate(param_combinations):
+                # 基础参数 - 使用模板参数或默认参数
+                base_params = template_params.copy() if template_params else get_model_default_params(selected_model)
                 
-            # 获取模型参数 - 复用现有函数
-            model_params = get_model_default_params(selected_model)
-            
-            # 准备API请求
-            payload = {
-                "input": current_prompt,
-                "model": selected_model,
-                "action": "generate",
-                "parameters": model_params
-            }
-            
-            # 创建批处理请求
-            batch_request = {
-                "interaction": interaction,
-                "api_key": api_key,
-                "payload": payload,
-                "provider_info": provider_info,
-                "is_batch": True,
-                "batch_index": i,
-                "batch_total": len(combinations)
-            }
-            
-            batch_requests.append(batch_request)
-            
-        # 创建或获取用户队列
-        user_id = str(interaction.user.id)
-        queue_id = f"user_{user_id}"
+                # 应用参数变化
+                current_model = selected_model
+                for k, param_name in enumerate(param_var_names):
+                    if k < len(param_combo):  # 确保索引有效
+                        param_value = param_combo[k]
+                        
+                        # 特殊处理尺寸参数
+                        if param_name == "size" and "x" in param_value:
+                            try:
+                                width, height = map(int, param_value.split("x"))
+                                base_params["width"] = width
+                                base_params["height"] = height
+                            except:
+                                pass
+                        # 特殊处理模型参数
+                        elif param_name == "model":
+                            if param_value in AVAILABLE_MODELS:
+                                current_model = param_value
+                                # 调整参数以适应特定模型
+                                if current_model.startswith("nai-diffusion-4"):
+                                    base_params["sm"] = False
+                                    base_params["sm_dyn"] = False
+                                    if base_params.get("noise_schedule") == "native":
+                                        base_params["noise_schedule"] = "karras"
+                                    # 添加v4特定参数
+                                    base_params["params_version"] = 3
+                                    base_params["use_coords"] = True
+                        # 特殊处理步数参数
+                        elif param_name == "steps":
+                            try:
+                                steps = int(param_value)
+                                base_params["steps"] = max(1, min(28, steps))
+                            except:
+                                pass
+                        # 特殊处理缩放参数
+                        elif param_name == "scale":
+                            try:
+                                scale = float(param_value)
+                                base_params["scale"] = max(1.0, min(10.0, scale))
+                            except:
+                                pass
+                        # 特殊处理采样器参数
+                        elif param_name == "sampler" and param_value in AVAILABLE_SAMPLERS:
+                            base_params["sampler"] = param_value
+                        # 特殊处理噪声调度参数
+                        elif param_name == "noise_schedule" and param_value in AVAILABLE_NOISE_SCHEDULES:
+                            if param_value != "native" or not current_model.startswith("nai-diffusion-4"):
+                                base_params["noise_schedule"] = param_value
+                            else:
+                                base_params["noise_schedule"] = "karras"  # v4不支持native
+                
+                # 准备API请求
+                payload = {
+                    "input": current_prompt,
+                    "model": current_model,
+                    "action": "generate",
+                    "parameters": base_params
+                }
+                
+                # 创建批处理请求
+                batch_request = {
+                    "interaction": interaction,
+                    "api_key": api_key,
+                    "payload": payload,
+                    "provider_info": provider_info,
+                    "is_batch": True,
+                    "batch_index": len(batch_requests),
+                    "batch_total": total_combinations
+                }
+                
+                batch_requests.append(batch_request)
         
-        if queue_id not in generation_queues:
-            generation_queues[queue_id] = {
-                "queue": [],
-                "processing": False,
-                "last_processed": None
-            }
-            
-        # 添加到队列
-        generation_queues[queue_id]["queue"].extend(batch_requests)
+        # 保存批量任务信息
+        batch_tasks[task_id][user_id] = {
+            "requests": batch_requests,
+            "created_at": datetime.datetime.now(),
+            "status": "pending",
+            "current": 0,
+            "total": len(batch_requests)
+        }
+        
+        # 启动处理任务
+        client.loop.create_task(process_batch_task(task_id, user_id))
         
         await interaction.followup.send(
-            f"✅ 已将 {len(batch_requests)} 个批量生成请求添加到队列。\n"
+            f"✅ 已创建批量生成任务 `{task_id}`\n"
             f"• 提示词模板: {prompt}\n"
-            f"• 变量组合数: {len(combinations)}\n"
-            f"• 队列长度: {len(generation_queues[queue_id]['queue'])}",
+            f"• 提示词变量组合数: {len(prompt_combinations)}\n"
+            f"• 参数变量组合数: {len(param_combinations)}\n"
+            f"• 总生成图像数: {total_combinations}\n"
+            f"• 状态: 队列处理中\n\n"
+            f"使用 `/batchstatus {task_id}` 查看任务进度。",
             ephemeral=True
         )
         
@@ -1793,6 +2324,117 @@ async def naibatch_command(
         print(f"批量生成时出错: {str(e)}")
         print(traceback.format_exc())
         await interaction.followup.send(f"❌ 批量生成时出错: {str(e)}")
+
+@tree.command(name="batchstatus", description="查看批量生成任务的状态")
+@app_commands.describe(
+    task_id="要查询的任务ID (可选，留空查看所有任务)"
+)
+async def batchstatus_command(interaction: discord.Interaction, task_id: str = None):
+    user_id = str(interaction.user.id)
+    
+    # 获取用户的任务
+    user_tasks = {}
+    for t_id, tasks in batch_tasks.items():
+        if user_id in tasks:
+            user_tasks[t_id] = tasks[user_id]
+    
+    if not user_tasks:
+        await interaction.response.send_message("你没有正在进行的批量任务。", ephemeral=True)
+        return
+    
+    # 如果指定了任务ID
+    if task_id:
+        if task_id not in batch_tasks or user_id not in batch_tasks[task_id]:
+            await interaction.response.send_message(f"未找到指定的任务 `{task_id}`。", ephemeral=True)
+            return
+        
+        task = batch_tasks[task_id][user_id]
+        
+        # 创建任务状态消息
+        status_text = "进行中" if task["status"] == "processing" else \
+                    "等待中" if task["status"] == "pending" else \
+                    "已完成" if task["status"] == "completed" else \
+                    "已取消"
+        
+        progress = f"{task['current']}/{task['total']}"
+        
+        embed = discord.Embed(
+            title=f"批量任务 {task_id} 状态",
+            description=f"任务状态: {status_text}",
+            color=0x3498db
+        )
+        
+        embed.add_field(name="进度", value=progress, inline=True)
+        embed.add_field(name="创建时间", value=task["created_at"].strftime("%Y-%m-%d %H:%M:%S"), inline=True)
+        
+        if task["status"] == "completed" and "completed_at" in task:
+            duration = task["completed_at"] - task["created_at"]
+            minutes, seconds = divmod(duration.seconds, 60)
+            embed.add_field(name="完成时间", value=task["completed_at"].strftime("%Y-%m-%d %H:%M:%S"), inline=True)
+            embed.add_field(name="耗时", value=f"{minutes}分{seconds}秒", inline=True)
+        
+        # 添加操作说明
+        if task["status"] in ["processing", "pending"]:
+            embed.add_field(
+                name="操作",
+                value="使用 `/cancelbatch " + task_id + "` 取消此任务",
+                inline=False
+            )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        # 显示所有任务的摘要
+        embed = discord.Embed(
+            title="批量任务列表",
+            description=f"你有 {len(user_tasks)} 个批量任务",
+            color=0x3498db
+        )
+        
+        for t_id, task in user_tasks.items():
+            status_text = "进行中" if task["status"] == "processing" else \
+                        "等待中" if task["status"] == "pending" else \
+                        "已完成" if task["status"] == "completed" else \
+                        "已取消"
+                        
+            progress = f"{task['current']}/{task['total']}"
+            
+            embed.add_field(
+                name=f"任务 {t_id}",
+                value=f"状态: {status_text}\n进度: {progress}\n创建: {task['created_at'].strftime('%m-%d %H:%M')}",
+                inline=True
+            )
+        
+        # 添加使用说明
+        embed.add_field(
+            name="查看详情",
+            value="使用 `/batchstatus [任务ID]` 查看任务详细状态",
+            inline=False
+        )
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@tree.command(name="cancelbatch", description="取消正在进行的批量生成任务")
+@app_commands.describe(
+    task_id="要取消的任务ID"
+)
+async def cancelbatch_command(interaction: discord.Interaction, task_id: str):
+    user_id = str(interaction.user.id)
+    
+    if task_id not in batch_tasks or user_id not in batch_tasks[task_id]:
+        await interaction.response.send_message(f"未找到指定的任务 `{task_id}`。", ephemeral=True)
+        return
+    
+    task = batch_tasks[task_id][user_id]
+    
+    # 检查任务是否已经完成或已取消
+    if task["status"] in ["completed", "cancelled"]:
+        await interaction.response.send_message(f"任务 `{task_id}` 已经 {task['status']}，无法取消。", ephemeral=True)
+        return
+    
+    # 取消任务
+    task["status"] = "cancelled"
+    
+    await interaction.response.send_message(f"✅ 已取消任务 `{task_id}`。", ephemeral=True)
 
 # ===== 协作生成命令 =====
 @tree.command(name="relay", description="开始接力生成图像的协作会话")
@@ -1835,7 +2477,8 @@ async def relay_command(
         "expires_at": expires_at,
         "is_completed": False,
         "api_key": api_key,
-        "provider_info": provider_info
+        "provider_info": provider_info,
+        "message_id": None  # 将在发送后更新
     }
     
     # 创建嵌入消息
@@ -1851,9 +2494,11 @@ async def relay_command(
     
     # 使用共享视图类
     view = RelayButtons(session_id, expires_at)
-    await interaction.followup.send(embed=embed, view=view)
+    message = await interaction.followup.send(embed=embed, view=view)
+    
+    # 保存消息ID以便后续更新
+    relay_sessions[session_id]["message_id"] = message.id
 
-# 1. 修复添加内容后更新功能
 async def handle_relay_add_content(interaction, session_id):
     """处理添加内容到接力会话的请求"""
     # 注意：不要在这里使用defer，因为我们要发送模态窗口
@@ -1902,46 +2547,51 @@ async def handle_relay_add_content(interaction, session_id):
                     session["participants"].append(user_id)
                     session["participant_names"].append(interaction.user.display_name)
                 
+                # 发送新的更新消息，而不是尝试编辑原始消息
                 try:
-                    # 更新原消息 - 简化并改进查找方式
                     channel = client.get_channel(int(session["channel_id"]))
                     if channel:
+                        # 创建新的嵌入消息
                         embed = discord.Embed(
-                            title="🏆 图像生成接力",
-                            description="多人协作完成一幅生成图像！",
-                            color=0x3498db
+                            title="🔄 接力生成更新",
+                            description=f"**{interaction.user.display_name}** 添加了新内容",
+                            color=0x9B59B6
                         )
                         
                         embed.add_field(name="💭 当前提示词", value=updated_prompt, inline=False)
-                        embed.add_field(name="👥 已参与", 
-                                      value=f"{len(session['participant_names'])}/{session['max_participants']}: {', '.join(session['participant_names'])}", 
-                                      inline=True)
-                        embed.add_field(name="⏰ 截止时间", value=f"<t:{int(session['expires_at'].timestamp())}:R>", inline=True)
+                        embed.add_field(
+                            name="👥 参与情况", 
+                            value=f"{len(session['participant_names'])}/{session['max_participants']} 名参与者", 
+                            inline=True
+                        )
+                        embed.add_field(
+                            name="⏰ 截止时间", 
+                            value=f"<t:{int(session['expires_at'].timestamp())}:R>", 
+                            inline=True
+                        )
                         
-                        # 更新消息，保留按钮
+                        # 创建新的按钮视图
                         view = RelayButtons(session_id, session["expires_at"])
                         
-                        # 简化查找逻辑
-                        async for message in channel.history(limit=20):
-                            if message.author == client.user and message.embeds:
-                                for msg_embed in message.embeds:
-                                    if msg_embed.title == "🏆 图像生成接力":
-                                        await message.edit(embed=embed, view=view)
-                                        break
+                        # 发送新消息
+                        await channel.send(embed=embed, view=view)
                 except Exception as update_error:
-                    print(f"更新消息时出错: {update_error}")
+                    print(f"发送更新消息时出错: {update_error}")
                 
-                await modal_interaction.followup.send(f"✅ 你已成功添加内容: \"{new_content}\"\n当前提示词: {updated_prompt}", ephemeral=True)
+                await modal_interaction.followup.send(
+                    f"✅ 你已成功添加内容: \"{new_content}\"\n当前提示词: {updated_prompt}", 
+                    ephemeral=True
+                )
             except Exception as e:
                 await modal_interaction.followup.send(f"❌ 添加内容时出错: {str(e)}", ephemeral=True)
     
-    # 正确的方式：直接使用response.send_modal而不是followup.send_modal
+    # 发送模态窗口
     await interaction.response.send_modal(AddContentModal())
 
-# 2. 修复完成接力功能 - 添加内容过滤和错误处理
+# 2. 完成接力功能
 async def handle_relay_complete(interaction, session_id):
     """完成接力会话并生成最终图像"""
-    await interaction.response.defer(thinking=True)
+    await interaction.response.defer()
     
     if session_id not in relay_sessions:
         await interaction.followup.send("❌ 此接力会话已不存在或已过期。", ephemeral=True)
@@ -2033,81 +2683,6 @@ async def handle_relay_complete(interaction, session_id):
         if session_id in relay_sessions:
             del relay_sessions[session_id]
 
-async def handle_relay_complete(interaction, session_id):
-    """完成接力会话并生成最终图像"""
-    await interaction.response.defer()
-    
-    if session_id not in relay_sessions:
-        await interaction.followup.send("❌ 此接力会话已不存在或已过期。", ephemeral=True)
-        return
-        
-    session = relay_sessions[session_id]
-    
-    # 检查会话是否已完成
-    if session["is_completed"]:
-        await interaction.followup.send("❌ 此接力会话已完成。", ephemeral=True)
-        return
-        
-    # 检查是否是参与者
-    user_id = str(interaction.user.id)
-    if user_id not in session["participants"]:
-        await interaction.followup.send("❌ 只有参与者可以完成接力会话。", ephemeral=True)
-        return
-    
-    # 标记会话为已完成
-    session["is_completed"] = True
-    
-    # 获取最终提示词
-    final_prompt = session["current_prompt"]
-    
-    # 使用API生成最终图像
-    api_key = session["api_key"]
-    provider_info = session["provider_info"]
-    
-    # 获取适合模型的参数
-    selected_model = DEFAULT_MODEL
-    model_params = get_model_default_params(selected_model)
-    
-    # 准备API请求
-    payload = {
-        "input": final_prompt,
-        "model": selected_model,
-        "action": "generate",
-        "parameters": model_params
-    }
-    
-    # 生成图像
-    image_data = await send_novelai_request(api_key, payload, interaction)
-    if image_data is None:
-        await interaction.followup.send("❌ 生成最终图像失败。请稍后重试。", ephemeral=False)
-        return
-    
-    # 创建文件对象并发送
-    file = discord.File(io.BytesIO(image_data), filename="relay_final.png")
-    
-    # 创建嵌入消息
-    embed = discord.Embed(
-        title="🎉 接力生成完成!",
-        description=f"由 {len(session['participants'])} 名成员共同创作",
-        color=0x2ecc71
-    )
-    
-    embed.add_field(name="📝 最终提示词", value=final_prompt, inline=False)
-    embed.add_field(name="👥 参与者", value=", ".join(session["participant_names"]), inline=False)
-    embed.add_field(name="🎨 模型", value=selected_model, inline=True)
-    
-    if provider_info:
-        embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
-        
-    embed.set_image(url="attachment://relay_final.png")
-    embed.set_footer(text=f"接力会话完成 • 由 {interaction.user.display_name} 确认完成")
-    
-    await interaction.followup.send(file=file, embed=embed)
-    
-    # 删除会话数据以释放内存
-    if session_id in relay_sessions:
-        del relay_sessions[session_id]
-
 # ===== 状态和信息命令 =====
 @tree.command(name="checkapi", description="检查NovelAI API的可用性状态")
 async def checkapi_command(interaction: discord.Interaction):
@@ -2174,6 +2749,16 @@ async def botstatus_command(interaction: discord.Interaction):
     active_queues = len([q for q in generation_queues.values() if q["queue"]])
     total_queued = sum(len(q["queue"]) for q in generation_queues.values())
     
+    # 收集批量任务数据
+    active_batch_tasks = 0
+    pending_batch_tasks = 0
+    for task_group in batch_tasks.values():
+        for task in task_group.values():
+            if task["status"] == "processing":
+                active_batch_tasks += 1
+            elif task["status"] == "pending":
+                pending_batch_tasks += 1
+    
     # 收集协作会话数据
     active_relays = len([s for s in relay_sessions.values() if not s["is_completed"]])
     
@@ -2193,6 +2778,9 @@ async def botstatus_command(interaction: discord.Interaction):
                    inline=True)
     embed.add_field(name="📋 队列统计", 
                    value=f"活跃队列: {active_queues}\n等待任务: {total_queued}", 
+                   inline=True)
+    embed.add_field(name="📊 批量任务", 
+                   value=f"活跃任务: {active_batch_tasks}\n等待任务: {pending_batch_tasks}", 
                    inline=True)
     embed.add_field(name="👥 协作会话", 
                    value=f"活跃接力: {active_relays}", 
@@ -2358,6 +2946,137 @@ async def update_command(interaction: discord.Interaction, branch: str = "main",
     except Exception as e:
         await interaction.followup.send(f"❌ 更新过程中出错: {str(e)}\n{traceback.format_exc()}")
 
+# ===== 预览批量生成 =====
+@tree.command(name="previewbatch", description="预览批量生成的组合而不实际生成图像")
+@app_commands.describe(
+    prompt="图像提示词模板，使用 {var1} {var2} 语法表示变量",
+    variations="变量值列表，格式: var1=值1,值2,值3|var2=值4,值5,值6",
+    param_variations="参数变化，格式: model=模型1,模型2|size=832x1216,1024x1024"
+)
+async def previewbatch_command(
+    interaction: discord.Interaction, 
+    prompt: str,
+    variations: str = "",
+    param_variations: str = ""
+):
+    await interaction.response.defer(thinking=True)
+    
+    try:
+        # 解析变量定义
+        var_definitions = {}
+        for part in variations.split('|'):
+            if '=' not in part:
+                continue
+                
+            var_name, var_values = part.split('=', 1)
+            var_name = var_name.strip()
+            var_values = [v.strip() for v in var_values.split(',')]
+            var_definitions[var_name] = var_values
+        
+        # 解析参数变化
+        param_var_definitions = {}
+        if param_variations:
+            for part in param_variations.split('|'):
+                if '=' not in part:
+                    continue
+                    
+                param_name, param_values = part.split('=', 1)
+                param_name = param_name.strip().lower()
+                param_values = [v.strip() for v in param_values.split(',')]
+                param_var_definitions[param_name] = param_values
+        
+        # 生成所有可能的组合
+        import itertools
+        
+        # 提示词变量组合
+        prompt_vars_to_combine = []
+        prompt_var_names = []
+        
+        for var_name, values in var_definitions.items():
+            prompt_vars_to_combine.append(values)
+            prompt_var_names.append(var_name)
+            
+        prompt_combinations = list(itertools.product(*prompt_vars_to_combine)) if prompt_vars_to_combine else [tuple()]
+        
+        # 参数变量组合
+        param_vars_to_combine = []
+        param_var_names = []
+        
+        for param_name, values in param_var_definitions.items():
+            param_vars_to_combine.append(values)
+            param_var_names.append(param_name)
+            
+        param_combinations = list(itertools.product(*param_vars_to_combine)) if param_vars_to_combine else [tuple()]
+        
+        # 计算总组合数
+        total_combinations = len(prompt_combinations) * len(param_combinations)
+        
+        # 预览所有组合
+        combinations_preview = []
+        count = 0
+        
+        # 最多预览50个组合
+        for prompt_combo in prompt_combinations:
+            # 创建当前组合的提示词
+            current_prompt = prompt
+            for j, var_name in enumerate(prompt_var_names):
+                if j < len(prompt_combo):  # 确保索引有效
+                    current_prompt = current_prompt.replace(f"{{{var_name}}}", prompt_combo[j])
+            
+            for param_combo in param_combinations:
+                # 当前组合的参数
+                current_params = {}
+                for k, param_name in enumerate(param_var_names):
+                    if k < len(param_combo):  # 确保索引有效
+                        current_params[param_name] = param_combo[k]
+                
+                # 添加到预览列表
+                combinations_preview.append({
+                    "prompt": current_prompt,
+                    "params": current_params
+                })
+                
+                count += 1
+                if count >= 50:
+                    break
+                    
+            if count >= 50:
+                break
+        
+        # 生成预览嵌入消息
+        embed = discord.Embed(
+            title="批量生成预览",
+            description=f"模板: {prompt}",
+            color=0x3498db
+        )
+        
+        embed.add_field(name="提示词变量", value=", ".join([f"{k}={len(v)}个值" for k, v in var_definitions.items()]) or "无", inline=True)
+        embed.add_field(name="参数变量", value=", ".join([f"{k}={len(v)}个值" for k, v in param_var_definitions.items()]) or "无", inline=True)
+        embed.add_field(name="总组合数", value=f"{total_combinations}个" + (" (仅预览前50个)" if total_combinations > 50 else ""), inline=False)
+        
+        # 添加组合预览示例
+        preview_text = ""
+        for i, combo in enumerate(combinations_preview[:10], 1):
+            param_text = ", ".join([f"{k}={v}" for k, v in combo["params"].items()]) if combo["params"] else "默认参数"
+            preview_text += f"{i}. 提示词: {combo['prompt'][:50]}{'...' if len(combo['prompt']) > 50 else ''}\n   参数: {param_text}\n\n"
+        
+        if combinations_preview:
+            embed.add_field(name="组合示例", value=preview_text, inline=False)
+        
+        # 添加使用说明
+        embed.add_field(
+            name="生成指令",
+            value=f"使用 `/naibatch` 命令并传入相同参数来开始批量生成。",
+            inline=False
+        )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        print(f"预览批量生成时出错: {str(e)}")
+        print(traceback.format_exc())
+        await interaction.followup.send(f"❌ 预览批量生成时出错: {str(e)}")
+
 # ===== 帮助命令 =====
 @tree.command(name="help", description="显示帮助信息")
 async def help_command(interaction: discord.Interaction):
@@ -2370,10 +3089,13 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🖼️ 图像生成命令",
         value=(
-            "• `/nai [prompt] [model]` - 使用基础设置快速生成图像\n"
-            "• `/naigen [prompt] [options...]` - 使用高级设置生成图像\n"
+            "• `/nai [prompt] [model] [template_id]` - 使用基础设置快速生成图像\n"
+            "• `/naigen [prompt] [options...] [template_id]` - 使用高级设置生成图像\n"
             "• `/naivariation [index] [type]` - 基于最近生成的图像创建变体\n"
-            "• `/naibatch [prompt] [variations]` - 批量生成多个变体图像\n"
+            "• `/naibatch [prompt] [variations] [param_variations]` - 批量生成多个变体图像\n"
+            "• `/previewbatch [prompt] [variations]` - 预览批量生成而不实际生成图像\n"
+            "• `/batchstatus [task_id]` - 查看批量生成任务状态\n"
+            "• `/cancelbatch [task_id]` - 取消批量生成任务\n"
             "• `/relay [prompt]` - 开始一个接力生成协作会话"
         ),
         inline=False
@@ -2382,9 +3104,10 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="📝 提示词模板",
         value=(
-            "• `/savetemplate [name] [prompt]` - 保存提示词模板\n"
+            "• `/savetemplate [name] [prompt] [save_params]` - 保存提示词模板\n"
             "• `/listtemplates [filter_tags]` - 查看可用的提示词模板\n"
-            "• `/usetemplate [id]` - 使用模板生成图像\n"
+            "• `/usetemplate [id] [override_prompt]` - 使用模板生成图像\n"
+            "• `/updatetemplate [id] [new_params]` - 更新现有模板\n"
             "• `/deletetemplate [id]` - 删除你创建的模板"
         ),
         inline=False
@@ -2407,6 +3130,17 @@ async def help_command(interaction: discord.Interaction):
         value=(
             "• `/checkapi` - 检查NovelAI API状态\n"
             "• `/botstatus` - 查看机器人运行状态和性能"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⭐ 新功能与改进",
+        value=(
+            "• **模板增强**: 模板现在可以保存完整参数并与其他命令结合使用\n"
+            "• **批量生成扩展**: 支持同时变化提示词和生成参数\n"
+            "• **接力生成改进**: 修复内容添加后的消息更新问题\n"
+            "• **预览功能**: 可以预览批量生成的组合而不实际生成图像"
         ),
         inline=False
     )

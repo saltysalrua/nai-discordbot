@@ -1,4 +1,12 @@
 discord.py>=2.3.2
 requests>=2.27.1
 python-dotenv>=0.19.2
+<<<<<<< HEAD
 aiohttp>=3.8.0
+gitpython>=3.1.30
+parse>=1.19.0
+pillow>=9.4.0
+itertools>=8.11.0
+=======
+aiohttp>=3.8.0
+>>>>>>> 1a714346f1f021a5f2d3a69b4f5bbc7eafac125d
