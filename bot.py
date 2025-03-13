@@ -329,6 +329,10 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
                     safe_params["params_version"] = 3
                     safe_params["use_coords"] = True
                     
+                    if parameters.get("legacy_uc") is not None:
+                        safe_params["legacy_uc"] = parameters["legacy_uc"]
+
+                    
                     # 添加v4提示词结构
                     safe_params["v4_prompt"] = {
                         "caption": {
@@ -1732,6 +1736,7 @@ async def nai_command(
     cfg_rescale="CFG重缩放 (0-1)",
     seed="随机种子 (留空为随机)",
     variety_plus="启用Variety+功能",
+    legacy_uc="启用legacy_uc功能 (仅v4模型)",
     template_id="要使用的模板ID (可选，可与其他参数结合)"
 )
 @app_commands.choices(
@@ -1767,6 +1772,7 @@ async def naigen_command(
     cfg_rescale: float = None,
     seed: str = None,
     variety_plus: bool = None,
+    legacy_uc: bool = None,
     template_id: str = None
 ):
     await interaction.response.defer(thinking=True)
@@ -1936,6 +1942,9 @@ async def naigen_command(
         if selected_model.startswith("nai-diffusion-4"):
             model_params["params_version"] = 3
             model_params["use_coords"] = True
+            
+            if legacy_uc:
+               model_params["legacy_uc"] = True
         
         # 准备API请求
         payload = {
@@ -1966,6 +1975,9 @@ async def naigen_command(
         if variety_plus:
             embed.add_field(name="Variety+", value="已启用", inline=True)
         
+        if legacy_uc and selected_model.startswith("nai-diffusion-4"):
+            embed.add_field(name="Legacy UC", value="已启用", inline=True)
+
         # 如果使用模板，显示模板信息
         if template_id and template_id in prompt_templates:
             template_name = prompt_templates[template_id].get("name", "未命名模板")
