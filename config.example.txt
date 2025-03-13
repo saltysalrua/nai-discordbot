@@ -9,7 +9,6 @@ DEFAULT_MODEL=nai-diffusion-4-full
 DEFAULT_SIZE_WIDTH=832
 DEFAULT_SIZE_HEIGHT=1216
 DEFAULT_STEPS=28
-<<<<<<< HEAD
 DEFAULT_SCALE=5.5
 DEFAULT_SAMPLER=k_euler_ancestral
 DEFAULT_NOISE_SCHEDULE=karras
@@ -22,10 +21,3 @@ BOT_ADMIN_IDS=123456789,987654321
 
 # GitHub仓库地址（用于更新命令）
 GITHUB_REPO=https://github.com/saltysalrua/nai-discordbot
-=======
-DEFAULT_SCALE=6
-DEFAULT_SAMPLER=k_euler_ancestral
-DEFAULT_NOISE_SCHEDULE=karras
-DEFAULT_CFG_RESCALE=0.1
-DEFAULT_NEG_PROMPT=lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts,blank page,
->>>>>>> 1a714346f1f021a5f2d3a69b4f5bbc7eafac125d
