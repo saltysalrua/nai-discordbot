@@ -13,6 +13,8 @@ import time
 import copy
 import shutil
 import sys
+import hashlib
+import uuid
 from typing import Dict, Optional, List, Union, Literal, Tuple, Any
 
 # ===== 全局变量 =====
@@ -32,7 +34,7 @@ batch_tasks = {}
 
 # 记录机器人启动时间和版本
 BOT_START_TIME = datetime.datetime.now()
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # ===== 配置管理 =====
 def read_config_file(file_path="config.txt"):
@@ -70,6 +72,33 @@ DEFAULT_CFG_RESCALE = float(config.get('DEFAULT_CFG_RESCALE', '0.1'))
 DEFAULT_NEG_PROMPT = config.get('DEFAULT_NEG_PROMPT', 'lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands')
 BOT_ADMIN_IDS = config.get('BOT_ADMIN_IDS', "").split(",")
 GITHUB_REPO = config.get('GITHUB_REPO', '')
+
+# 从配置文件加载翻译设置
+ENABLE_TRANSLATION = config.get('ENABLE_TRANSLATION', 'true').lower() == 'true'
+TRANSLATION_API = config.get('TRANSLATION_API', 'baidu')
+
+# 百度翻译配置
+BAIDU_APPID = config.get('BAIDU_APPID', '')
+BAIDU_KEY = config.get('BAIDU_KEY', '')
+BAIDU_API_URL = "https://fanyi-api.baidu.com/api/trans/vip/translate"
+
+# 有道翻译配置
+YOUDAO_APPID = config.get('YOUDAO_APPID', '')
+YOUDAO_APPKEY = config.get('YOUDAO_APPKEY', '')
+YOUDAO_API_URL = "https://openapi.youdao.com/api"
+
+# Azure翻译配置
+AZURE_KEY = config.get('AZURE_KEY', '')
+AZURE_REGION = config.get('AZURE_REGION', '')
+
+# OpenAI兼容API配置
+OPENAI_API_KEY = config.get('OPENAI_API_KEY', '')
+OPENAI_API_BASE = config.get('OPENAI_API_BASE', 'https://api.openai.com/v1')
+OPENAI_MODEL_NAME = config.get('OPENAI_MODEL_NAME', 'gpt-3.5-turbo')
+
+# Google AI Studio (Gemini API) 配置
+GOOGLE_AI_API_KEY = config.get('GOOGLE_AI_API_KEY', '')
+GOOGLE_AI_MODEL_NAME = config.get('GOOGLE_AI_MODEL_NAME', 'gemini-pro')
 
 # Discord机器人设置
 intents = discord.Intents.default()
@@ -198,6 +227,379 @@ def load_templates_from_file():
     """从文件加载提示词模板"""
     return load_data_from_file("prompt_templates.json", key_field="created_at")
 
+# ===== 翻译功能模块 =====
+
+# 翻译缓存，提高性能并减少API调用
+translation_cache = {}
+
+async def is_chinese(text: str) -> bool:
+    """检测文本是否包含中文字符"""
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':
+            return True
+    return False
+
+async def translate_text_if_chinese(text: str) -> Tuple[str, bool, Optional[str]]:
+    """如果文本包含中文，将其翻译为英文，否则直接返回原文
+    
+    参数:
+        text: 待翻译的文本
+        
+    返回:
+        (翻译后文本, 是否被翻译, 错误信息)
+    """
+    # 如果禁用翻译功能，直接返回原文
+    if not ENABLE_TRANSLATION:
+        return text, False, None
+        
+    # 检查是否包含中文
+    if not await is_chinese(text):
+        return text, False, None
+        
+    # 检查缓存
+    if text in translation_cache:
+        return translation_cache[text], True, None
+        
+    # 根据配置的翻译API执行翻译
+    if TRANSLATION_API == 'baidu':
+        translated, error = await translate_with_baidu(text)
+    elif TRANSLATION_API == 'youdao':
+        translated, error = await translate_with_youdao(text)
+    elif TRANSLATION_API == 'azure':
+        translated, error = await translate_with_azure(text)
+    elif TRANSLATION_API == 'openai' or TRANSLATION_API == 'llm':
+        translated, error = await translate_with_openai_compatible(text)
+    elif TRANSLATION_API == 'google' or TRANSLATION_API == 'gemini':
+        translated, error = await translate_with_google_ai(text)
+    else:
+        return text, False, f"未知的翻译API: {TRANSLATION_API}"
+        
+    # 如果翻译成功，缓存结果
+    if error is None:
+        translation_cache[text] = translated
+        return translated, True, None
+    else:
+        return text, False, error
+        
+async def translate_with_baidu(text: str, from_lang="zh", to_lang="en") -> Tuple[str, Optional[str]]:
+    """使用百度翻译API将文本从中文翻译为英文
+    
+    参数:
+        text: 待翻译的文本
+        from_lang: 源语言代码
+        to_lang: 目标语言代码
+        
+    返回:
+        (翻译后文本, 错误信息)
+    """
+    # 如果未配置API，返回错误
+    if not BAIDU_APPID or not BAIDU_KEY:
+        return text, "百度翻译API未配置"
+        
+    # 生成随机数作为盐值
+    salt = str(random.randint(32768, 65536))
+    
+    # 计算签名
+    sign_str = BAIDU_APPID + text + salt + BAIDU_KEY
+    sign = hashlib.md5(sign_str.encode()).hexdigest()
+    
+    # 构建参数
+    params = {
+        'appid': BAIDU_APPID,
+        'q': text,
+        'from': from_lang,
+        'to': to_lang,
+        'salt': salt,
+        'sign': sign
+    }
+    
+    try:
+        # 发送API请求
+        response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.get(BAIDU_API_URL, params=params, timeout=5)
+        )
+        
+        result = response.json()
+        
+        # 检查是否有错误
+        if 'error_code' in result:
+            error_msg = f"翻译API错误: {result['error_code']} - {result.get('error_msg', '未知错误')}"
+            print(error_msg)
+            return text, error_msg
+            
+        # 提取翻译结果
+        translated = " ".join([item['dst'] for item in result['trans_result']])
+        return translated, None
+        
+    except Exception as e:
+        error_msg = f"翻译过程中出错: {str(e)}"
+        print(error_msg)
+        return text, error_msg
+
+async def translate_with_youdao(text: str, from_lang="zh-CHS", to_lang="en") -> Tuple[str, Optional[str]]:
+    """使用有道翻译API将文本从中文翻译为英文"""
+    # 如果未配置API，返回错误
+    if not YOUDAO_APPID or not YOUDAO_APPKEY:
+        return text, "有道翻译API未配置"
+        
+    # 生成盐值和时间戳
+    salt = str(uuid.uuid1())
+    curtime = str(int(time.time()))
+    
+    # 计算输入长度
+    input_len = len(text)
+    input_text = text if input_len <= 20 else text[:10] + str(input_len) + text[-10:]
+    
+    # 计算签名
+    sign_str = YOUDAO_APPID + input_text + salt + curtime + YOUDAO_APPKEY
+    sign = hashlib.sha256(sign_str.encode()).hexdigest()
+    
+    # 构建参数
+    params = {
+        'q': text,
+        'from': from_lang,
+        'to': to_lang,
+        'appKey': YOUDAO_APPID,
+        'salt': salt,
+        'sign': sign,
+        'signType': 'v3',
+        'curtime': curtime
+    }
+    
+    try:
+        # 发送API请求
+        response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.post(YOUDAO_API_URL, data=params, timeout=5)
+        )
+        
+        result = response.json()
+        
+        # 检查是否有错误
+        if result.get('errorCode') != '0':
+            error_msg = f"有道翻译API错误: {result.get('errorCode', '未知错误')}"
+            print(error_msg)
+            return text, error_msg
+            
+        # 提取翻译结果
+        translated = " ".join(result.get('translation', [text]))
+        return translated, None
+        
+    except Exception as e:
+        error_msg = f"翻译过程中出错: {str(e)}"
+        print(error_msg)
+        return text, error_msg
+
+async def translate_with_azure(text: str, from_lang="zh-Hans", to_lang="en") -> Tuple[str, Optional[str]]:
+    """使用Azure翻译API将文本从中文翻译为英文"""
+    # 如果未配置API，返回错误
+    if not AZURE_KEY or not AZURE_REGION:
+        return text, "Azure翻译API未配置"
+        
+    # 构建请求URL
+    url = f"https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&from={from_lang}&to={to_lang}"
+    
+    # 构建请求头
+    headers = {
+        'Ocp-Apim-Subscription-Key': AZURE_KEY,
+        'Ocp-Apim-Subscription-Region': AZURE_REGION,
+        'Content-type': 'application/json'
+    }
+    
+    # 构建请求体
+    body = [{'text': text}]
+    
+    try:
+        # 发送API请求
+        response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.post(url, headers=headers, json=body, timeout=5)
+        )
+        
+        result = response.json()
+        
+        # 检查是否有错误
+        if 'error' in result:
+            error_msg = f"Azure翻译API错误: {result['error'].get('message', '未知错误')}"
+            print(error_msg)
+            return text, error_msg
+            
+        # 提取翻译结果
+        translated = result[0]['translations'][0]['text']
+        return translated, None
+        
+    except Exception as e:
+        error_msg = f"翻译过程中出错: {str(e)}"
+        print(error_msg)
+        return text, error_msg
+
+async def translate_with_openai_compatible(text: str, from_lang="zh", to_lang="en") -> Tuple[str, Optional[str]]:
+    """使用OpenAI兼容接口的LLM进行翻译
+    
+    此函数可以使用任何符合OpenAI API格式的服务，包括:
+    - OpenAI API
+    - 本地部署的模型 (如LM Studio, LocalAI)
+    - 兼容OpenAI接口的其他服务 (如Claude API)
+    
+    参数:
+        text: 待翻译的文本
+        from_lang: 源语言代码
+        to_lang: 目标语言代码
+        
+    返回:
+        (翻译后文本, 错误信息)
+    """
+    # 如果未配置API，返回错误
+    if not OPENAI_API_KEY or not OPENAI_API_BASE:
+        return text, "OpenAI兼容API未配置"
+    
+    # 构建API请求URL
+    url = f"{OPENAI_API_BASE}/chat/completions"
+    
+    # 为不同的目标语言构建系统提示
+    system_message = f"你是一个专业的翻译助手。请将用户输入的{from_lang}文本翻译成{to_lang}，只返回翻译结果，不要加任何解释、注释或其他内容。保持原文的格式和标点符号。"
+    
+    if to_lang == "en":
+        system_message = "You are a professional translator. Translate the following Chinese text into English. Only provide the translation without any explanations, comments, or additional content. Maintain the original format and punctuation."
+    
+    # 构建请求体
+    payload = {
+        "model": OPENAI_MODEL_NAME,  # 从配置中获取模型名称
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": text}
+        ],
+        "temperature": 0.3,  # 低温度，更确定性的输出
+        "max_tokens": min(len(text) * 2, 4000),  # 动态设置token上限
+    }
+    
+    # 构建请求头
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENAI_API_KEY}"
+    }
+    
+    try:
+        # 发送API请求
+        response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.post(url, headers=headers, json=payload, timeout=30)
+        )
+        
+        # 检查HTTP状态码
+        if response.status_code != 200:
+            error_msg = f"LLM API错误: HTTP {response.status_code}, {response.text}"
+            print(error_msg)
+            return text, error_msg
+        
+        # 解析响应
+        result = response.json()
+        
+        # 检查是否有错误
+        if "error" in result:
+            error_msg = f"LLM API错误: {result['error'].get('message', '未知错误')}"
+            print(error_msg)
+            return text, error_msg
+        
+        # 提取翻译结果
+        if "choices" in result and len(result["choices"]) > 0:
+            translated = result["choices"][0]["message"]["content"].strip()
+            return translated, None
+        else:
+            return text, "API返回了空结果"
+            
+    except Exception as e:
+        error_msg = f"LLM翻译过程中出错: {str(e)}"
+        print(error_msg)
+        return text, error_msg
+      
+async def translate_with_google_ai(text: str, from_lang="zh", to_lang="en") -> Tuple[str, Optional[str]]:
+    """使用Google AI Studio (Gemini API) 进行翻译
+    
+    参数:
+        text: 待翻译的文本
+        from_lang: 源语言代码
+        to_lang: 目标语言代码
+        
+    返回:
+        (翻译后文本, 错误信息)
+    """
+    # 如果未配置API，返回错误
+    if not GOOGLE_AI_API_KEY:
+        return text, "Google AI API未配置"
+    
+    # 构建API请求URL - Gemini API格式
+    model = GOOGLE_AI_MODEL_NAME  # 从配置中获取模型名称，例如 "gemini-pro"
+    url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GOOGLE_AI_API_KEY}"
+    
+    # 构建翻译提示
+    if to_lang == "en":
+        system_instruction = "You are a professional translator. Translate the following Chinese text into English. Only provide the translation without any explanations, comments, or additional content. Maintain the original format and punctuation."
+    else:
+        system_instruction = f"你是一个专业的翻译助手。请将用户输入的{from_lang}文本翻译成{to_lang}，只返回翻译结果，不要加任何解释、注释或其他内容。保持原文的格式和标点符号。"
+    
+    # 构建请求体 - Gemini API格式
+    payload = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": f"{system_instruction}\n\n{text}"}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "topK": 40,
+            "topP": 0.95,
+            "maxOutputTokens": min(len(text) * 2, 8192)
+        }
+    }
+    
+    # 构建请求头
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        # 发送API请求
+        response = await client.loop.run_in_executor(
+            None,
+            lambda: requests.post(url, headers=headers, json=payload, timeout=30)
+        )
+        
+        # 检查HTTP状态码
+        if response.status_code != 200:
+            error_msg = f"Google AI API错误: HTTP {response.status_code}, {response.text}"
+            print(error_msg)
+            return text, error_msg
+        
+        # 解析响应
+        result = response.json()
+        
+        # 检查是否有错误
+        if "error" in result:
+            error_msg = f"Google AI API错误: {result['error'].get('message', '未知错误')}"
+            print(error_msg)
+            return text, error_msg
+        
+        # 提取翻译结果 - Gemini API格式
+        if "candidates" in result and len(result["candidates"]) > 0:
+            candidate = result["candidates"][0]
+            if "content" in candidate and "parts" in candidate["content"]:
+                parts = candidate["content"]["parts"]
+                if parts and "text" in parts[0]:
+                    translated = parts[0]["text"].strip()
+                    return translated, None
+            
+        return text, "API返回结果格式异常"
+            
+    except Exception as e:
+        error_msg = f"Google AI翻译过程中出错: {str(e)}"
+        print(error_msg)
+        return text, error_msg
+        
 # ===== API请求处理 =====
 async def send_novelai_request(api_key, payload, interaction, retry_count=0):
     """使用改进的错误处理逻辑发送NovelAI API请求"""
@@ -857,7 +1259,18 @@ async def process_queued_request(request):
         title += f" ({batch_index+1}/{batch_total})"
         
     embed = discord.Embed(title=title, color=0xf75c7e)
-    embed.add_field(name="提示词", value=payload.get("input", "")[:1024], inline=False)
+    
+    # 获取原始和翻译信息
+    original_prompt = request.get("original_prompt", "")
+    was_translated = request.get("was_translated", False)
+
+    # 根据是否翻译显示提示词
+    if was_translated and original_prompt:
+        embed.add_field(name="原始提示词", value=original_prompt[:512], inline=False)
+        embed.add_field(name="翻译提示词", value=payload.get("input", "")[:512], inline=False)
+    else:
+        embed.add_field(name="提示词", value=payload.get("input", "")[:1024], inline=False)
+    
     embed.add_field(name="模型", value=payload.get("model", DEFAULT_MODEL), inline=True)
     
     if provider_info:
@@ -867,7 +1280,7 @@ async def process_queued_request(request):
     embed.set_footer(text=f"由 {interaction.user.display_name} 生成")
     
     await interaction.followup.send(file=file, embed=embed)
-
+    
 # 协作会话清理
 async def cleanup_expired_sessions():
     """定期清理过期的协作会话"""
@@ -1511,7 +1924,23 @@ async def usetemplate_command(
         return
     
     # 添加额外提示词
+    override_translated = False
+    original_override = ""
+    
     if override_prompt:
+        # 翻译额外提示词（如果包含中文）
+        original_override = override_prompt
+        translated_override, was_translated, error = await translate_text_if_chinese(override_prompt)
+        
+        if error:
+            await interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始提示词继续。", ephemeral=True)
+            translated_override = override_prompt
+            was_translated = False
+        
+        # 使用翻译后的提示词
+        override_prompt = translated_override
+        override_translated = was_translated
+        
         prompt = f"{prompt}, {override_prompt}"
     
     # 准备参数
@@ -1535,6 +1964,21 @@ async def usetemplate_command(
     else:
         model_params = get_model_default_params(selected_model)
     
+    # 翻译整个提示词（如果没有处理过额外提示词的翻译）
+    # 这对整个提示词进行翻译而不仅仅是额外部分
+    original_full_prompt = ""
+    was_full_translated = False
+    
+    if not override_translated:
+        original_full_prompt = prompt
+        translated_prompt, was_full_translated, error = await translate_text_if_chinese(prompt)
+        
+        if error:
+            await interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始提示词继续。", ephemeral=True)
+            was_full_translated = False
+        else:
+            prompt = translated_prompt
+    
     # 准备API请求
     payload = {
         "input": prompt,
@@ -1553,7 +1997,22 @@ async def usetemplate_command(
     
     # 创建嵌入消息
     embed = discord.Embed(title=f"模板生成: {template.get('name')}", color=0x3498db)
-    embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+    
+    # 显示提示词 - 根据不同的翻译情况处理
+    if override_translated:
+        # 如果额外提示词被翻译
+        embed.add_field(name="模板提示词", value=template.get("prompt", "")[:512], inline=False)
+        embed.add_field(name="添加的原始内容", value=original_override[:256], inline=False)
+        embed.add_field(name="添加的翻译内容", value=override_prompt[:256], inline=False)
+        embed.add_field(name="最终提示词", value=prompt[:512], inline=False)
+    elif was_full_translated:
+        # 如果整个提示词被翻译
+        embed.add_field(name="原始提示词", value=original_full_prompt[:512], inline=False)
+        embed.add_field(name="翻译提示词", value=prompt[:512], inline=False)
+    else:
+        # 如果没有翻译
+        embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+    
     embed.add_field(name="模型", value=selected_model, inline=True)
     
     # 显示关键参数
@@ -1750,6 +2209,18 @@ async def nai_command(
             await interaction.followup.send("❌ 必须提供提示词或有效的模板。", ephemeral=True)
             return
         
+        # 翻译提示词（如果包含中文）
+        original_prompt = prompt
+        translated_prompt, was_translated, error = await translate_text_if_chinese(prompt)
+        
+        if error:
+            await interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始提示词继续生成。", ephemeral=True)
+            translated_prompt = prompt
+            was_translated = False
+            
+        # 使用翻译后的提示词
+        prompt = translated_prompt
+        
         # 验证并设置模型
         selected_model = model if model in AVAILABLE_MODELS else DEFAULT_MODEL
         
@@ -1787,7 +2258,14 @@ async def nai_command(
         
         # 创建基本嵌入消息
         embed = discord.Embed(title="NovelAI 生成图像", color=0xf75c7e)
-        embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+        
+        # 根据是否翻译显示提示词
+        if was_translated:
+            embed.add_field(name="原始提示词", value=original_prompt[:512], inline=False)
+            embed.add_field(name="翻译提示词", value=prompt[:512], inline=False)
+        else:
+            embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+            
         embed.add_field(name="模型", value=selected_model, inline=True)
         
         # 如果使用模板，显示模板信息
@@ -1819,7 +2297,7 @@ async def nai_command(
         print(f"生成图像时出错: {str(e)}")
         print(traceback.format_exc())
         await interaction.followup.send(f"❌ 生成图像时出错: {str(e)}")
-
+        
 @tree.command(name="naigen", description="使用NovelAI生成图像 (高级选项)")
 @app_commands.describe(
     prompt="图像生成提示词",
@@ -1926,6 +2404,18 @@ async def naigen_command(
         if not prompt:
             await interaction.followup.send("❌ 必须提供提示词或有效的模板。", ephemeral=True)
             return
+        
+        # 翻译提示词（如果包含中文）
+        original_prompt = prompt
+        translated_prompt, was_translated, error = await translate_text_if_chinese(prompt)
+        
+        if error:
+            await interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始提示词继续生成。", ephemeral=True)
+            translated_prompt = prompt
+            was_translated = False
+            
+        # 使用翻译后的提示词
+        prompt = translated_prompt
         
         # 用用户提供的参数覆盖模板参数
         # 选择模型的优先级：用户指定 > 模板指定 > 默认
@@ -2063,7 +2553,14 @@ async def naigen_command(
         
         # 创建嵌入消息
         embed = discord.Embed(title="NovelAI 高级生成", color=0xf75c7e)
-        embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+        
+        # 根据是否翻译显示提示词
+        if was_translated:
+            embed.add_field(name="原始提示词", value=original_prompt[:512], inline=False)
+            embed.add_field(name="翻译提示词", value=prompt[:512], inline=False)
+        else:
+            embed.add_field(name="提示词", value=prompt[:1024], inline=False)
+            
         embed.add_field(name="模型", value=selected_model, inline=True)
         embed.add_field(name="尺寸", value=f"{width}x{height}", inline=True)
         
@@ -2136,6 +2633,18 @@ async def naivariation_command(
             await interaction.followup.send("❌ 提示词增强模式需要提供额外提示词", ephemeral=True)
             return
             
+        # 翻译额外提示词（如果包含中文）
+        original_additional = additional_prompt
+        translated_additional, was_translated, error = await translate_text_if_chinese(additional_prompt)
+        
+        if error:
+            await interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始提示词继续。", ephemeral=True)
+            translated_additional = additional_prompt
+            was_translated = False
+            
+        # 使用翻译后的提示词
+        additional_prompt = translated_additional
+        
         # 添加新提示词内容
         original_prompt = new_payload.get("input", "")
         new_payload["input"] = f"{original_prompt}, {additional_prompt}"
@@ -2159,10 +2668,14 @@ async def naivariation_command(
     file = discord.File(io.BytesIO(image_data), filename="variation.png")
     
     embed = discord.Embed(title=f"图像变体 - {variation_type}", color=0xf75c7e)
-    embed.add_field(name="原始提示词", value=original_record["payload"].get("input", "")[:1024], inline=False)
+    embed.add_field(name="原始提示词", value=original_record["payload"].get("input", "")[:512], inline=False)
     
     if variation_type == "提示词增强":
-        embed.add_field(name="添加的内容", value=additional_prompt, inline=False)
+        if was_translated:
+            embed.add_field(name="添加的原始内容", value=original_additional[:256], inline=False)
+            embed.add_field(name="添加的翻译内容", value=additional_prompt[:256], inline=False)
+        else:
+            embed.add_field(name="添加的内容", value=additional_prompt[:512], inline=False)
         
     embed.add_field(name="模型", value=new_payload.get("model", DEFAULT_MODEL), inline=True)
     embed.add_field(name="种子", value=str(original_record["seed"]), inline=True)
@@ -2174,7 +2687,7 @@ async def naivariation_command(
     embed.set_footer(text=f"由 {interaction.user.display_name} 生成 | 变体")
     
     await interaction.followup.send(file=file, embed=embed)
-
+    
 # ===== 批量生成命令 =====
 @tree.command(name="naibatch", description="提交批量图像生成请求")
 @app_commands.describe(
@@ -2332,6 +2845,18 @@ async def naibatch_command(
                 if j < len(prompt_combo):  # 确保索引有效
                     current_prompt = current_prompt.replace(f"{{{var_name}}}", prompt_combo[j])
             
+            # 翻译提示词（如果包含中文）
+            original_prompt = current_prompt
+            translated_prompt, was_translated, error = await translate_text_if_chinese(current_prompt)
+            
+            if error:
+                print(f"批量生成翻译警告: {error}")
+                translated_prompt = current_prompt
+                was_translated = False
+                
+            # 使用翻译后的提示词
+            current_prompt = translated_prompt
+            
             for param_idx, param_combo in enumerate(param_combinations):
                 # 基础参数 - 使用模板参数或默认参数
                 base_params = template_params.copy() if template_params else get_model_default_params(selected_model)
@@ -2403,7 +2928,9 @@ async def naibatch_command(
                     "provider_info": provider_info,
                     "is_batch": True,
                     "batch_index": len(batch_requests),
-                    "batch_total": total_combinations
+                    "batch_total": total_combinations,
+                    "original_prompt": original_prompt if was_translated else "",
+                    "was_translated": was_translated
                 }
                 
                 batch_requests.append(batch_request)
@@ -2435,7 +2962,7 @@ async def naibatch_command(
         print(f"批量生成时出错: {str(e)}")
         print(traceback.format_exc())
         await interaction.followup.send(f"❌ 批量生成时出错: {str(e)}")
-
+        
 @tree.command(name="batchstatus", description="查看批量生成任务的状态")
 @app_commands.describe(
     task_id="要查询的任务ID (可选，留空查看所有任务)"
@@ -2572,6 +3099,18 @@ async def relay_command(
     api_key, provider_info = await get_api_key(interaction)
     if not api_key:
         return
+    
+    # 翻译初始提示词（如果包含中文）
+    original_prompt = initial_prompt
+    translated_prompt, was_translated, error = await translate_text_if_chinese(initial_prompt)
+    
+    if error:
+        await interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始提示词继续。", ephemeral=True)
+        translated_prompt = initial_prompt
+        was_translated = False
+        
+    # 使用翻译后的提示词
+    initial_prompt = translated_prompt
         
     # 创建会话
     session_id = f"relay_{guild_id}_{int(time.time())}"
@@ -2592,6 +3131,15 @@ async def relay_command(
         "message_id": None  # 将在发送后更新
     }
     
+    # 如果初始提示词被翻译，保存翻译信息
+    if was_translated:
+        relay_sessions[session_id]["translations"] = [{
+            "original": original_prompt,
+            "translated": initial_prompt,
+            "user_id": str(interaction.user.id),
+            "timestamp": datetime.datetime.now().isoformat()
+        }]
+    
     # 创建嵌入消息
     embed = discord.Embed(
         title="🏆 图像生成接力",
@@ -2599,7 +3147,13 @@ async def relay_command(
         color=0x3498db
     )
     
-    embed.add_field(name="💭 当前提示词", value=initial_prompt, inline=False)
+    # 根据是否翻译显示提示词
+    if was_translated:
+        embed.add_field(name="💭 原始提示词", value=original_prompt, inline=False)
+        embed.add_field(name="💭 翻译提示词", value=initial_prompt, inline=False)
+    else:
+        embed.add_field(name="💭 当前提示词", value=initial_prompt, inline=False)
+        
     embed.add_field(name="👥 已参与", value=f"1/{max_participants}: {interaction.user.display_name}", inline=True)
     embed.add_field(name="⏰ 截止时间", value=f"<t:{int(expires_at.timestamp())}:R>", inline=True)
     
@@ -2609,7 +3163,8 @@ async def relay_command(
     
     # 保存消息ID以便后续更新
     relay_sessions[session_id]["message_id"] = message.id
-
+    
+#1.添加内容
 async def handle_relay_add_content(interaction, session_id):
     """处理添加内容到接力会话的请求"""
     # 注意：不要在这里使用defer，因为我们要发送模态窗口
@@ -2647,11 +3202,35 @@ async def handle_relay_add_content(interaction, session_id):
             try:
                 # 更新会话内容
                 new_content = self.content.value.strip()
+
+                # 翻译新内容（如果包含中文）
+                original_content = new_content
+                translated_content, was_translated, error = await translate_text_if_chinese(new_content)
+
+                if error:
+                    await modal_interaction.followup.send(f"⚠️ 翻译警告: {error}\n将使用原始内容继续。", ephemeral=True)
+                    translated_content = new_content
+                    was_translated = False
+                    
+                # 使用翻译后的内容
+                new_content = translated_content
+
                 current_prompt = session["current_prompt"]
-                
+
                 # 添加新内容
                 updated_prompt = f"{current_prompt}, {new_content}"
                 session["current_prompt"] = updated_prompt
+
+                # 如果是翻译内容，保存原始内容到会话中
+                if was_translated:
+                    if "translations" not in session:
+                        session["translations"] = []
+                    session["translations"].append({
+                        "original": original_content,
+                        "translated": new_content,
+                        "user_id": user_id,
+                        "timestamp": datetime.datetime.now().isoformat()
+                    })
                 
                 # 添加参与者（如果是新参与者）
                 if user_id not in session["participants"]:
@@ -2669,6 +3248,13 @@ async def handle_relay_add_content(interaction, session_id):
                             color=0x9B59B6
                         )
                         
+                        # 如果内容被翻译，同时显示原始内容和翻译内容
+                        if was_translated:
+                            embed.add_field(name="添加的原始内容", value=original_content, inline=False)
+                            embed.add_field(name="翻译后内容", value=new_content, inline=False)
+                        else:
+                            embed.add_field(name="添加的内容", value=new_content, inline=False)
+                            
                         embed.add_field(name="💭 当前提示词", value=updated_prompt, inline=False)
                         embed.add_field(
                             name="👥 参与情况", 
@@ -2690,7 +3276,9 @@ async def handle_relay_add_content(interaction, session_id):
                     print(f"发送更新消息时出错: {update_error}")
                 
                 await modal_interaction.followup.send(
-                    f"✅ 你已成功添加内容: \"{new_content}\"\n当前提示词: {updated_prompt}", 
+                    f"✅ 你已成功添加内容!" + 
+                    (f"\n原始内容: \"{original_content}\"\n翻译内容: \"{new_content}\"" if was_translated else f"\n添加内容: \"{new_content}\"") +
+                    f"\n\n当前提示词: {updated_prompt}", 
                     ephemeral=True
                 )
             except Exception as e:
@@ -2698,7 +3286,7 @@ async def handle_relay_add_content(interaction, session_id):
     
     # 发送模态窗口
     await interaction.response.send_modal(AddContentModal())
-
+    
 # 2. 完成接力功能
 async def handle_relay_complete(interaction, session_id):
     """完成接力会话并生成最终图像"""
@@ -2768,6 +3356,21 @@ async def handle_relay_complete(interaction, session_id):
         embed.add_field(name="👥 参与者", value=", ".join(session["participant_names"]), inline=False)
         embed.add_field(name="🎨 模型", value=selected_model, inline=True)
         
+        # 如果有翻译内容，显示翻译历史
+        if "translations" in session and session["translations"]:
+            translations_summary = []
+            for i, trans in enumerate(session["translations"], 1):
+                user_id = trans["user_id"]
+                user_name = next((name for uid, name in zip(session["participants"], session["participant_names"]) if uid == user_id), "未知用户")
+                translations_summary.append(f"{i}. {user_name}: {trans['original']} → {trans['translated']}")
+                
+            if translations_summary:
+                embed.add_field(
+                    name="📝 翻译历史", 
+                    value="\n".join(translations_summary[:5]) + (f"\n... 以及其他 {len(translations_summary)-5} 项" if len(translations_summary) > 5 else ""),
+                    inline=False
+                )
+        
         if provider_info:
             embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
             
@@ -2793,7 +3396,7 @@ async def handle_relay_complete(interaction, session_id):
         # 删除会话数据以释放内存
         if session_id in relay_sessions:
             del relay_sessions[session_id]
-
+            
 # ===== 状态和信息命令 =====
 @tree.command(name="checkapi", description="检查NovelAI API的可用性状态")
 async def checkapi_command(interaction: discord.Interaction):
@@ -3251,7 +3854,8 @@ async def help_command(interaction: discord.Interaction):
             "• **模板增强**: 模板现在可以保存完整参数并与其他命令结合使用\n"
             "• **批量生成扩展**: 支持同时变化提示词和生成参数\n"
             "• **接力生成改进**: 修复内容添加后的消息更新问题\n"
-            "• **预览功能**: 可以预览批量生成的组合而不实际生成图像"
+            "• **预览功能**: 可以预览批量生成的组合而不实际生成图像\n"
+            "• **翻译功能**: 使用中文生成图像吧！"
         ),
         inline=False
     )
