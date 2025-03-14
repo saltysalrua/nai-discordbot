@@ -606,9 +606,31 @@ async def periodic_save_keys():
         save_templates_to_file()
         print(f"[{datetime.datetime.now()}] 已执行定期保存")
 
-# 检查API密钥有效性
-async def check_api_key_validity(api_key):
-    """检查API密钥是否有效"""
+# 添加网络连接检查函数
+async def check_internet_connection():
+    """检查互联网连接，使用多个可靠站点进行测试"""
+    test_sites = [
+        "https://www.google.com",
+        "https://www.cloudflare.com",
+        "https://www.amazon.com"
+    ]
+    
+    for site in test_sites:
+        try:
+            response = await client.loop.run_in_executor(
+                None, 
+                lambda: requests.get(site, timeout=5)
+            )
+            if response.status_code == 200:
+                return True
+        except:
+            pass
+    
+    return False
+
+# 改进 API 密钥有效性检查
+async def check_api_key_validity(api_key, max_retries=2, retry_delay=3):
+    """检查API密钥是否有效，带有重试机制"""
     test_payload = {
         "input": "test",
         "model": "nai-diffusion-3",
@@ -631,31 +653,73 @@ async def check_api_key_validity(api_key):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
     }
     
-    try:
-        response = await client.loop.run_in_executor(
-            None, 
-            lambda: requests.post(
-                NAI_API_URL,
-                headers=headers,
-                json=test_payload,
-                timeout=10
+    # 多次尝试
+    for attempt in range(max_retries):
+        try:
+            response = await client.loop.run_in_executor(
+                None, 
+                lambda: requests.post(
+                    NAI_API_URL,
+                    headers=headers,
+                    json=test_payload,
+                    timeout=10
+                )
             )
-        )
+            
+            # 检查响应状态码
+            if response.status_code in (401, 402):
+                # 这些是确定的无效密钥响应
+                return False
+                
+            if response.status_code == 200:
+                # 确定有效
+                return True
+                
+            # 其他状态码可能是临时性问题，继续重试
+                
+        except requests.exceptions.RequestException:
+            # 连接错误，可能是临时网络问题，等待后重试
+            pass
+            
+        if attempt < max_retries - 1:
+            await asyncio.sleep(retry_delay)
+    
+    # 如果所有尝试都失败，检查互联网连接
+    internet_available = await check_internet_connection()
+    if not internet_available:
+        print("⚠️ 互联网连接不可用，API密钥验证被跳过")
+        return True  # 假定密钥有效，因为无法确定
         
-        # 检查响应状态码
-        if response.status_code in (401, 402):
-            return False
-        return True
-    except:
-        # 连接错误也视为可能无效
-        return False
+    # 所有尝试都失败，但互联网可用，密钥可能确实无效
+    return False
 
-# 每小时检查密钥有效性
+# 改进密钥验证定时任务
 async def hourly_validate_keys():
-    """每小时检查API密钥有效性"""
+    """每小时检查API密钥有效性，带有网络检查和智能重试"""
     while True:
         await asyncio.sleep(3600)  # 每小时检查一次
         print(f"[{datetime.datetime.now()}] 开始执行API密钥有效性检查...")
+        
+        # 首先检查互联网连接
+        internet_available = await check_internet_connection()
+        if not internet_available:
+            print("⚠️ 互联网连接不可用，跳过API密钥验证")
+            continue
+        
+        # 首先检查NovelAI站点是否可访问
+        try:
+            site_response = await client.loop.run_in_executor(
+                None,
+                lambda: requests.get("https://novelai.net/", timeout=10)
+            )
+            
+            if site_response.status_code != 200:
+                print(f"⚠️ NovelAI网站返回状态码 {site_response.status_code}，延迟密钥验证")
+                continue
+                
+        except requests.exceptions.RequestException:
+            print("⚠️ 无法连接到NovelAI网站，延迟密钥验证")
+            continue
         
         invalid_keys = []
         checked_count = 0
@@ -666,8 +730,8 @@ async def hourly_validate_keys():
                 invalid_keys.append(user_id)
                 continue
             
-            # 检查API密钥有效性
-            is_valid = await check_api_key_validity(key_data["key"])
+            # 检查API密钥有效性 - 使用改进的检查函数
+            is_valid = await check_api_key_validity(key_data["key"], max_retries=2)
             checked_count += 1
             
             if not is_valid:
@@ -679,11 +743,29 @@ async def hourly_validate_keys():
         
         # 移除无效密钥
         for user_id in invalid_keys:
-            del api_keys[user_id]
-        
-        # 如果有删除持久化密钥，保存更新
-        if any(user_id in api_keys and api_keys[user_id].get("persist", False) for user_id in invalid_keys):
-            save_api_keys_to_file()
+            if user_id in api_keys:  # 再次检查，因为可能在循环过程中被修改
+                # 如果是持久化密钥，从文件中也删除
+                was_persistent = api_keys[user_id].get("persist", False)
+                del api_keys[user_id]
+                
+                if was_persistent:
+                    try:
+                        # 直接读取文件内容
+                        if os.path.exists("api_keys.json"):
+                            with open("api_keys.json", "r", encoding="utf-8") as f:
+                                file_keys = json.load(f)
+                            
+                            # 如果用户 ID 在文件中存在，删除它
+                            if user_id in file_keys:
+                                del file_keys[user_id]
+                            
+                            # 写回文件
+                            with open("api_keys.json", "w", encoding="utf-8") as f:
+                                json.dump(file_keys, f, ensure_ascii=False, indent=2)
+                                
+                            print(f"已从 api_keys.json 文件中删除无效用户 {user_id} 的密钥")
+                    except Exception as e:
+                        print(f"从文件中删除无效密钥时出错: {str(e)}")
         
         print(f"[{datetime.datetime.now()}] API密钥检查完成，检查了 {checked_count} 个密钥，移除了 {len(invalid_keys)} 个无效密钥")
 
@@ -1069,9 +1151,26 @@ async def deletekey_command(interaction: discord.Interaction):
         was_persistent = api_keys[user_id].get("persist", False)
         del api_keys[user_id]
         
-        # 如果是持久化密钥，立即更新存储
+        # 如果是持久化密钥，需要从文件中读取所有密钥，删除此用户的密钥，然后重新写入
         if was_persistent:
-            save_api_keys_to_file()
+            try:
+                # 直接读取文件内容而不是通过 load_api_keys_from_file 函数
+                if os.path.exists("api_keys.json"):
+                    with open("api_keys.json", "r", encoding="utf-8") as f:
+                        file_keys = json.load(f)
+                    
+                    # 如果用户 ID 在文件中存在，删除它
+                    if user_id in file_keys:
+                        del file_keys[user_id]
+                    
+                    # 写回文件
+                    with open("api_keys.json", "w", encoding="utf-8") as f:
+                        json.dump(file_keys, f, ensure_ascii=False, indent=2)
+                    
+                    print(f"已从 api_keys.json 文件中删除用户 {user_id} 的密钥")
+            except Exception as e:
+                print(f"从文件中删除密钥时出错: {str(e)}")
+                # 即使出错，我们也继续响应给用户
         
         await interaction.response.send_message(
             "✅ 你的API密钥已从机器人中删除。" + 
