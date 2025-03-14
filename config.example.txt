@@ -21,3 +21,33 @@ BOT_ADMIN_IDS=123456789,987654321
 
 # GitHub仓库地址（用于更新命令）
 GITHUB_REPO=https://github.com/saltysalrua/nai-discordbot
+
+# 翻译设置
+ENABLE_TRANSLATION=true
+TRANSLATION_API=baidu
+# 支持的API: baidu, youdao, azure, openai, google
+
+# 百度翻译API设置
+BAIDU_APPID=你的APPID
+BAIDU_KEY=你的密钥
+
+# 有道翻译API设置
+YOUDAO_APPID=你的应用ID
+YOUDAO_APPKEY=你的应用密钥
+
+# Azure翻译API设置
+AZURE_KEY=你的密钥
+AZURE_REGION=eastasia
+
+# OpenAI兼容接口设置
+# 可用于OpenAI API或兼容OpenAI API的本地/第三方LLM服务
+OPENAI_API_KEY=你的API密钥
+OPENAI_API_BASE=https://api.openai.com/v1
+# 如果使用本地模型，例如设置为: http://localhost:1234/v1
+OPENAI_MODEL_NAME=gpt-3.5-turbo
+# 如果使用本地模型，设置为相应的模型名称
+
+# Google AI Studio (Gemini API) 设置
+GOOGLE_AI_API_KEY=你的API密钥
+GOOGLE_AI_MODEL_NAME=gemini-pro
+# 其他可选模型: gemini-pro-vision, gemini-ultra
