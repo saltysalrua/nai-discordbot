@@ -15,6 +15,14 @@ DEFAULT_NOISE_SCHEDULE=karras
 DEFAULT_CFG_RESCALE=0.1
 DEFAULT_NEG_PROMPT=lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts,blank page,
 
+# 批量生成限制设置
+DAILY_BATCH_LIMIT=20         
+# 每用户每日最大批量生成数量
+MAX_VARIATIONS_PER_VARIABLE=2    
+# 每个变量最多允许的值数量
+MAX_CONCURRENT_BATCHES=1         
+# 每用户最大并发批量任务数
+
 # 高级配置参数
 # 管理员用户ID（逗号分隔，这些用户可以执行更新等特权命令）
 BOT_ADMIN_IDS=123456789,987654321
@@ -49,5 +57,4 @@ OPENAI_MODEL_NAME=gpt-3.5-turbo
 
 # Google AI Studio (Gemini API) 设置
 GOOGLE_AI_API_KEY=你的API密钥
-GOOGLE_AI_MODEL_NAME=gemini-pro
-# 其他可选模型: gemini-pro-vision, gemini-ultra
+GOOGLE_AI_MODEL_NAME=gemini-2.0-flash
