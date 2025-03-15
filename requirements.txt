@@ -5,6 +5,4 @@ aiohttp>=3.8.0
 gitpython>=3.1.30
 parse>=1.19.0
 pillow>=9.4.0
-itertools>=8.11.0
-hashlib>=3.2
-random>=3.9.0
+uuid>=1.30

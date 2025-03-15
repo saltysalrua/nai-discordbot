@@ -21,7 +21,6 @@ from typing import Dict, Optional, List, Union, Literal, Tuple, Any
 # API密钥和模板存储
 api_keys = {}
 prompt_templates = {}
-prompt_name_index = {}  # 名称索引：(user_id, name) -> template_id
 # 使用跟踪
 key_usage_counter = {}
 key_last_used = {}
@@ -32,8 +31,6 @@ generation_queues = {}
 relay_sessions = {}
 # 用户批量任务状态
 batch_tasks = {}
-# 用户批量限制
-user_batch_limits = {}  # 记录用户每日批量生成数量
 
 # 记录机器人启动时间和版本
 BOT_START_TIME = datetime.datetime.now()
@@ -75,11 +72,6 @@ DEFAULT_CFG_RESCALE = float(config.get('DEFAULT_CFG_RESCALE', '0.1'))
 DEFAULT_NEG_PROMPT = config.get('DEFAULT_NEG_PROMPT', 'lowres, {bad}, error, fewer, extra, missing, worst quality, jpeg artifacts, bad quality, watermark, unfinished, displeasing, chromatic aberration, signature, extra digits, artistic error, username, scan, [abstract], bad anatomy, bad hands')
 BOT_ADMIN_IDS = config.get('BOT_ADMIN_IDS', "").split(",")
 GITHUB_REPO = config.get('GITHUB_REPO', '')
-
-# 从配置文件加载批量生成限制设置
-DAILY_BATCH_LIMIT = int(config.get('DAILY_BATCH_LIMIT', '50'))
-MAX_VARIATIONS_PER_VARIABLE = int(config.get('MAX_VARIATIONS_PER_VARIABLE', '5'))
-MAX_CONCURRENT_BATCHES = int(config.get('MAX_CONCURRENT_BATCHES', '2'))
 
 # 从配置文件加载翻译设置
 ENABLE_TRANSLATION = config.get('ENABLE_TRANSLATION', 'true').lower() == 'true'
@@ -228,75 +220,13 @@ def load_api_keys_from_file():
     return load_data_from_file("api_keys.json")
 
 def save_templates_to_file():
-    """将提示词模板和名称索引保存到文件"""
+    """将提示词模板保存到文件"""
     save_data_to_file(prompt_templates, "prompt_templates.json", key_field="created_at")
-    
-    # 保存名称索引
-    serializable_name_index = {}
-    for (user_id, name), template_id in prompt_name_index.items():
-        key = f"{user_id}:{name}"  # 将元组转换为字符串键
-        serializable_name_index[key] = template_id
-    
-    try:
-        with open("template_name_index.json", "w", encoding="utf-8") as f:
-            json.dump(serializable_name_index, f, ensure_ascii=False, indent=2)
-        print(f"已保存 {len(serializable_name_index)} 条名称索引到 template_name_index.json")
-    except Exception as e:
-        print(f"保存名称索引时出错: {str(e)}")
 
 def load_templates_from_file():
-    """从文件加载提示词模板和名称索引"""
-    templates = load_data_from_file("prompt_templates.json", key_field="created_at")
-    
-    # 加载名称索引
-    name_index = {}
-    try:
-        if os.path.exists("template_name_index.json"):
-            with open("template_name_index.json", "r", encoding="utf-8") as f:
-                serialized_index = json.load(f)
-                
-            for key, template_id in serialized_index.items():
-                # 将字符串键转回元组
-                parts = key.split(":", 1)
-                if len(parts) == 2:
-                    user_id, name = parts
-                    name_index[(user_id, name)] = template_id
-            
-            print(f"已成功加载 {len(name_index)} 条名称索引")
-    except Exception as e:
-        print(f"加载名称索引时出错: {str(e)}")
-    
-    return templates, name_index
+    """从文件加载提示词模板"""
+    return load_data_from_file("prompt_templates.json", key_field="created_at")
 
-def save_batch_limits_to_file():
-    """将用户批量限制保存到文件"""
-    try:
-        with open("batch_limits.json", "w", encoding="utf-8") as f:
-            json.dump(user_batch_limits, f, ensure_ascii=False, indent=2)
-        print(f"已保存用户批量限制数据")
-    except Exception as e:
-        print(f"保存用户批量限制数据时出错: {str(e)}")
-
-def load_batch_limits_from_file():
-    """从文件加载用户批量限制"""
-    if not os.path.exists("batch_limits.json"):
-        return {}
-    
-    try:
-        with open("batch_limits.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-            
-        # 验证数据是否为今天的
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        # 只保留今天的数据
-        if today in data:
-            return {today: data[today]}
-        else:
-            return {}
-    except Exception as e:
-        print(f"加载用户批量限制数据时出错: {str(e)}")
-        return {}
-        
 # ===== 翻译功能模块 =====
 
 # 翻译缓存，提高性能并减少API调用
@@ -933,39 +863,6 @@ def get_model_default_params(model):
     return params
 
 # ===== 辅助功能 =====
-# 添加模板名称自动补全函数
-async def template_name_autocomplete(interaction: discord.Interaction, current: str):
-    """为模板名称提供自动补全建议"""
-    user_id = str(interaction.user.id)
-    guild_id = interaction.guild_id
-    
-    # 收集用户可访问的所有模板
-    available_templates = []
-    
-    # 用户自己的模板
-    for key, template_id in prompt_name_index.items():
-        if key[0] == user_id and template_id in prompt_templates:
-            template = prompt_templates[template_id]
-            available_templates.append({"name": template.get("name", ""), "source": "个人"})
-    
-    # 服务器共享模板
-    if guild_id:
-        for template_id, template in prompt_templates.items():
-            if guild_id in template.get("shared_guilds", []) and template.get("creator_id") != user_id:
-                available_templates.append({"name": template.get("name", ""), "source": "服务器"})
-    
-    # 过滤匹配当前输入的模板
-    filtered = [
-        t for t in available_templates 
-        if current.lower() in t["name"].lower()
-    ]
-    
-    # 返回建议（最多25个）
-    return [
-        app_commands.Choice(name=f"{t['name']} ({t['source']})", value=t["name"])
-        for t in filtered[:25]
-    ]
-    
 # 获取当前服务器中的API密钥共享数量
 def get_guild_shared_keys_info(guild_id):
     """获取当前服务器中的API密钥共享信息"""
@@ -1103,14 +1000,12 @@ async def get_api_key(interaction: discord.Interaction) -> tuple[Optional[str], 
 
 # ===== 后台任务 =====
 # 定期保存任务
-# 定期保存任务
 async def periodic_save_keys():
-    """定期保存标记为持久化的API密钥、提示词模板和批量限制数据"""
+    """定期保存标记为持久化的API密钥和提示词模板"""
     while True:
         await asyncio.sleep(60 * 15)  # 每15分钟保存一次
         save_api_keys_to_file()
         save_templates_to_file()
-        save_batch_limits_to_file()  # 新增：保存批量限制数据
         print(f"[{datetime.datetime.now()}] 已执行定期保存")
 
 # 添加网络连接检查函数
@@ -1276,25 +1171,6 @@ async def hourly_validate_keys():
         
         print(f"[{datetime.datetime.now()}] API密钥检查完成，检查了 {checked_count} 个密钥，移除了 {len(invalid_keys)} 个无效密钥")
 
-# 定期清理过期的批量限制
-async def cleanup_batch_limits():
-    """每天凌晨重置用户的批量生成限制"""
-    while True:
-        # 计算到明天凌晨的秒数
-        now = datetime.datetime.now()
-        tomorrow = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        seconds_until_midnight = (tomorrow - now).total_seconds()
-        
-        # 等待到凌晨
-        await asyncio.sleep(seconds_until_midnight)
-        
-        # 清理前一天的记录
-        yesterday = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-        if yesterday in user_batch_limits:
-            del user_batch_limits[yesterday]
-            
-        print(f"[{datetime.datetime.now()}] 已重置用户批量生成限制")
-        
 # 定期检查过期密钥
 async def check_expired_keys():
     """定期检查并清理过期的API密钥"""
@@ -1405,44 +1281,6 @@ async def process_queued_request(request):
     
     await interaction.followup.send(file=file, embed=embed)
     
-# 添加模板名称查找函数（在辅助功能部分）
-def find_template_by_name(name, user_id, guild_id=None):
-    """
-    按名称查找模板，优先级：
-    1. 用户自己创建的模板
-    2. 当前服务器共享的模板
-    3. 全局共享的模板
-    
-    参数:
-        name: 模板名称
-        user_id: 用户ID
-        guild_id: 服务器ID
-        
-    返回: (template_id, template_data) 或 (None, None)
-    """
-    # 先查找用户自己的模板
-    user_key = (str(user_id), name.lower())
-    if user_key in prompt_name_index:
-        template_id = prompt_name_index[user_key]
-        if template_id in prompt_templates:
-            return template_id, prompt_templates[template_id]
-    
-    # 查找服务器共享的同名模板
-    if guild_id:
-        for template_id, template in prompt_templates.items():
-            if (template.get("name", "").lower() == name.lower() and 
-                guild_id in template.get("shared_guilds", [])):
-                return template_id, template
-    
-    # 查找全局共享模板
-    for template_id, template in prompt_templates.items():
-        if template.get("name", "").lower() == name.lower() and template.get("shared_guilds", []):
-            # 确认是共享的且不是当前用户的
-            if template.get("creator_id") != str(user_id):
-                return template_id, template
-    
-    return None, None
-    
 # 协作会话清理
 async def cleanup_expired_sessions():
     """定期清理过期的协作会话"""
@@ -1507,11 +1345,6 @@ async def process_batch_task(task_id, user_id):
     task["current"] = 0
     task["total"] = len(task["requests"])
     
-    # 记录批量任务开始 - 新增
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    print(f"[{datetime.datetime.now()}] 用户 {user_id} 开始批量任务 {task_id}，总计 {task['total']} 个请求")
-    print(f"用户今日已使用: {user_batch_limits.get(today, {}).get(user_id, 0)}/{DAILY_BATCH_LIMIT}")
-    
     # 处理所有请求
     for i, request in enumerate(task["requests"]):
         # 如果任务被取消，提前退出
@@ -1542,21 +1375,11 @@ async def process_batch_task(task_id, user_id):
         batch_tasks[task_id][user_id]["status"] = "completed"
         batch_tasks[task_id][user_id]["completed_at"] = datetime.datetime.now()
         
-        # 发送完成通知 - 修改为包含配额信息
+        # 发送完成通知
         interaction = task["requests"][0].get("interaction")
         if interaction:
-            today = datetime.datetime.now().strftime("%Y-%m-%d")
-            remain = DAILY_BATCH_LIMIT - user_batch_limits.get(today, {}).get(user_id, 0)
-            
-            await interaction.followup.send(
-                f"✅ 批量任务 `{task_id}` 已完成，成功生成 {task['current']}/{task['total']} 张图像。\n" +
-                f"你今日剩余批量配额: {remain}张",
-                ephemeral=True
-            )
-        
-        # 添加完成日志 - 新增
-        print(f"[{datetime.datetime.now()}] 用户 {user_id} 完成批量任务 {task_id}，成功 {task['current']}/{task['total']} 个请求")
-        
+            await interaction.followup.send(f"✅ 批量任务 `{task_id}` 已完成，成功生成 {task['current']}/{task['total']} 张图像。", ephemeral=True)
+
 # ===== 机器人初始化 =====
 @client.event
 async def on_ready():
@@ -1565,30 +1388,17 @@ async def on_ready():
     await tree.sync()  # 同步斜杠命令
     
     # 从文件加载API密钥
-    global api_keys, prompt_templates, prompt_name_index
+    global api_keys, prompt_templates
     loaded_keys = load_api_keys_from_file()
     if loaded_keys:
         api_keys.update(loaded_keys)
         print(f"已从文件加载 {len(loaded_keys)} 个API密钥")
         
     # 加载提示词模板
-    loaded_templates, loaded_name_index = load_templates_from_file()
+    loaded_templates = load_templates_from_file()
     if loaded_templates:
         prompt_templates = loaded_templates
-        prompt_name_index = loaded_name_index
-        print(f"已加载 {len(loaded_templates)} 个提示词模板和 {len(loaded_name_index)} 条名称索引")
-    
-    # 加载用户批量限制 - 新增
-    global user_batch_limits
-    loaded_batch_limits = load_batch_limits_from_file()
-    if loaded_batch_limits:
-        user_batch_limits = loaded_batch_limits
-        
-        # 计算加载的限制总数
-        total_users = 0
-        for day, users in user_batch_limits.items():
-            total_users += len(users)
-        print(f"已加载 {total_users} 个用户的批量限制数据")
+        print(f"已加载 {len(loaded_templates)} 个提示词模板")
     
     # 初始化队列系统
     global generation_queues
@@ -1611,10 +1421,9 @@ async def on_ready():
     client.loop.create_task(check_expired_keys())  # 密钥过期检查
     client.loop.create_task(periodic_save_keys())  # 定期保存
     client.loop.create_task(hourly_validate_keys())  # 密钥验证
-    client.loop.create_task(cleanup_batch_limits())  # 批量限制清理 - 新增
     
     print(f"机器人 v{VERSION} 已完全初始化并准备就绪")
-    
+
 # ===== API密钥管理命令 =====
 @tree.command(name="apikey", description="注册或管理你的NovelAI API密钥")
 @app_commands.describe(
@@ -1883,47 +1692,26 @@ async def sharedkeys_command(interaction: discord.Interaction):
 @app_commands.describe(
     name="模板名称",
     prompt="提示词内容",
-    position="提示词位置",
     sharing="设置模板是否在此服务器共享",
     tags="标签，用逗号分隔（例如: 风景,动漫）",
     save_params="是否保存高级参数设置"
-)
-@app_commands.choices(
-    position=[
-        app_commands.Choice(name="前缀 - 添加到提示词开头", value="prefix"),
-        app_commands.Choice(name="后缀 - 添加到提示词末尾", value="suffix"),
-        app_commands.Choice(name="替换 - 完全替换提示词", value="replace")
-    ]
 )
 async def savetemplate_command(
     interaction: discord.Interaction, 
     name: str, 
     prompt: str, 
-    position: str = "suffix",
     sharing: Literal["私人使用", "服务器共享"] = "私人使用",
     tags: str = "",
     save_params: bool = False
 ):
     user_id = str(interaction.user.id)
-    
-    # 检查是否存在同名模板
-    user_key = (user_id, name.lower())
-    old_template_id = prompt_name_index.get(user_key)
-    is_overwriting = False
-    
-    if old_template_id and old_template_id in prompt_templates:
-        is_overwriting = True
-        template_id = old_template_id  # 复用原ID
-    else:
-        template_id = f"{user_id}_{int(time.time())}"
-    
+    template_id = f"{user_id}_{int(time.time())}"
     guild_id = interaction.guild_id if interaction.guild_id and sharing == "服务器共享" else None
     
     # 保存模板信息
     template_data = {
         "name": name,
         "prompt": prompt,
-        "position": position,  # 新增位置属性
         "creator_id": user_id,
         "creator_name": interaction.user.display_name,
         "shared_guilds": [guild_id] if guild_id else [],
@@ -1973,7 +1761,6 @@ async def savetemplate_command(
             }
     
     prompt_templates[template_id] = template_data
-    prompt_name_index[user_key] = template_id  # 更新名称索引
     
     # 保存模板
     save_templates_to_file()
@@ -1981,25 +1768,22 @@ async def savetemplate_command(
     # 构建确认信息
     sharing_text = "仅限你个人使用" if not guild_id else f"在此服务器共享使用"
     tags_text = tags if tags else "无"
-    position_text = "前缀" if position == "prefix" else "后缀" if position == "suffix" else "替换"
     
     # 添加参数信息
     params_text = "已保存（包含当前生成设置）" if save_params else "未保存（仅保存提示词）"
     
-    overwrite_notice = "（覆盖了同名模板）" if is_overwriting else ""
-    
     await interaction.response.send_message(
-        f"✅ 提示词模板 \"{name}\" {overwrite_notice}已保存！\n"
+        f"✅ 提示词模板 \"{name}\" 已保存！\n"
         f"• 提示词: {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n"
-        f"• 位置: {position_text}\n"
         f"• 共享设置: {sharing_text}\n"
         f"• 标签: {tags_text}\n"
-        f"• 高级参数: {params_text}\n\n"
-        f"使用 `/usetemplate {name}` 来基于此模板生成图像，\n"
-        f"或在其他生成命令中使用 `template_name={name}` 参数引用此模板。",
+        f"• 高级参数: {params_text}\n"
+        f"• 模板ID: {template_id}\n\n"
+        f"使用 `/usetemplate {template_id}` 来基于此模板生成图像，\n"
+        f"或在其他生成命令中使用 `template_id={template_id}` 参数引用此模板。",
         ephemeral=True
     )
-    
+
 @tree.command(name="listtemplates", description="查看可用的提示词模板")
 @app_commands.describe(
     filter_tags="按标签筛选（用逗号分隔）",
@@ -2039,8 +1823,7 @@ async def listtemplates_command(
                 "tags": template.get("tags", []),
                 "has_params": "params" in template,
                 "is_creator": is_creator,
-                "is_shared": is_guild_shared,
-                "position": template.get("position", "suffix")  # 添加位置信息
+                "is_shared": is_guild_shared
             }
             available_templates.append(template_info)
     
@@ -2070,15 +1853,10 @@ async def listtemplates_command(
         tags_display = ", ".join(template["tags"]) if template["tags"] else "无标签"
         source_display = "✓ 你创建的" if template["is_creator"] else "👥 服务器共享" if template["is_shared"] else "🌐 全局共享"
         params_display = "🔧 包含参数设置" if template["has_params"] else "📝 仅含提示词"
-        position_display = {
-            "prefix": "前缀",
-            "suffix": "后缀",
-            "replace": "替换"
-        }.get(template["position"], "后缀")
         
         embed.add_field(
-            name=f"{i}. {template['name']}",  # 突出显示名称而非ID
-            value=f"位置: {position_display}\n创建者: {template['creator']}\n标签: {tags_display}\n{source_display}\n{params_display}",
+            name=f"{i}. {template['name']}",
+            value=f"ID: `{template['id']}`\n创建者: {template['creator']}\n标签: {tags_display}\n{source_display}\n{params_display}",
             inline=i % 2 == 1  # 交替布局
         )
     
@@ -2086,20 +1864,18 @@ async def listtemplates_command(
     embed.add_field(
         name="使用方法",
         value=(
-            "• 单独使用: `/usetemplate [模板名称]`\n"
-            "• 与基础生成结合: `/nai [其他参数] template_name=[模板名称]`\n"
-            "• 与高级生成结合: `/naigen [其他参数] template_name=[模板名称]`\n"
-            "• 与批量生成结合: `/naibatch [变量定义] template_name=[模板名称]`"
+            "• 单独使用: `/usetemplate [模板ID]`\n"
+            "• 与高级生成结合: `/naigen template_id=[模板ID] [其他参数]`\n"
+            "• 与批量生成结合: `/naibatch template_id=[模板ID] [变量定义]`"
         ),
         inline=False
     )
     
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@app_commands.autocomplete(template_name=template_name_autocomplete)    
 @tree.command(name="usetemplate", description="使用提示词模板生成图像")
 @app_commands.describe(
-    template_name="模板名称",
+    template_id="模板ID（从 /listtemplates 获取）",
     model="选择模型（可覆盖模板中的模型设置）",
     override_prompt="额外添加到提示词的内容（可选）",
     use_params="是否使用模板中保存的参数设置"
@@ -2112,7 +1888,7 @@ async def listtemplates_command(
 )
 async def usetemplate_command(
     interaction: discord.Interaction, 
-    template_name: str,
+    template_id: str,
     model: str = None,
     override_prompt: str = "",
     use_params: bool = True
@@ -2124,18 +1900,21 @@ async def usetemplate_command(
     if not api_key:
         return
     
-    # 按名称查找模板
-    template_id, template = find_template_by_name(
-        template_name, 
-        interaction.user.id, 
-        interaction.guild_id
-    )
+    # 查找模板
+    if template_id not in prompt_templates:
+        await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+        return
     
-    if not template:
-        await interaction.followup.send(
-            f"❌ 未找到名为 \"{template_name}\" 的模板。请检查名称或使用 `/listtemplates` 查看可用模板。", 
-            ephemeral=True
-        )
+    template = prompt_templates[template_id]
+    user_id = str(interaction.user.id)
+    guild_id = interaction.guild_id
+    
+    # 检查访问权限
+    is_creator = template.get("creator_id") == user_id
+    is_guild_shared = guild_id in template.get("shared_guilds", [])
+    
+    if not (is_creator or is_guild_shared):
+        await interaction.followup.send("❌ 你没有权限使用此模板。它可能是私人模板或未在此服务器共享。", ephemeral=True)
         return
     
     # 获取模板提示词
@@ -2147,7 +1926,6 @@ async def usetemplate_command(
     # 添加额外提示词
     override_translated = False
     original_override = ""
-    position = template.get("position", "suffix")  # 获取位置属性
     
     if override_prompt:
         # 翻译额外提示词（如果包含中文）
@@ -2163,13 +1941,7 @@ async def usetemplate_command(
         override_prompt = translated_override
         override_translated = was_translated
         
-        # 根据位置属性添加提示词
-        if position == "prefix":
-            prompt = f"{prompt}, {override_prompt}"
-        elif position == "suffix":
-            prompt = f"{override_prompt}, {prompt}"
-        else:  # replace - 保留原提示词，额外内容作为后缀
-            prompt = f"{prompt}, {override_prompt}"
+        prompt = f"{prompt}, {override_prompt}"
     
     # 准备参数
     selected_model = model if model else template.get("model", DEFAULT_MODEL)
@@ -2193,6 +1965,7 @@ async def usetemplate_command(
         model_params = get_model_default_params(selected_model)
     
     # 翻译整个提示词（如果没有处理过额外提示词的翻译）
+    # 这对整个提示词进行翻译而不仅仅是额外部分
     original_full_prompt = ""
     was_full_translated = False
     
@@ -2263,26 +2036,20 @@ async def usetemplate_command(
     
     await interaction.followup.send(file=file, embed=embed)
 
-@app_commands.autocomplete(template_name=template_name_autocomplete)    
 @tree.command(name="deletetemplate", description="删除你创建的提示词模板")
 @app_commands.describe(
-    template_name="要删除的模板名称"
+    template_id="要删除的模板ID"
 )
-async def deletetemplate_command(interaction: discord.Interaction, template_name: str):
+async def deletetemplate_command(interaction: discord.Interaction, template_id: str):
     user_id = str(interaction.user.id)
     
-    # 按名称查找模板
-    template_id, template = find_template_by_name(
-        template_name, 
-        user_id,
-        interaction.guild_id
-    )
-    
-    if not template:
-        await interaction.response.send_message(f"❌ 未找到名为 \"{template_name}\" 的模板。", ephemeral=True)
+    # 检查模板是否存在
+    if template_id not in prompt_templates:
+        await interaction.response.send_message("❌ 未找到指定的模板。", ephemeral=True)
         return
     
     # 检查是否是创建者
+    template = prompt_templates[template_id]
     if template.get("creator_id") != user_id:
         await interaction.response.send_message("❌ 你不是此模板的创建者，无法删除。", ephemeral=True)
         return
@@ -2291,79 +2058,46 @@ async def deletetemplate_command(interaction: discord.Interaction, template_name
     template_name = template.get("name", "未命名模板")
     del prompt_templates[template_id]
     
-    # 删除名称索引
-    user_key = (user_id, template_name.lower())
-    if user_key in prompt_name_index:
-        del prompt_name_index[user_key]
-    
     # 保存更新
     save_templates_to_file()
     
     await interaction.response.send_message(f"✅ 已删除模板 \"{template_name}\"。", ephemeral=True)
 
-@app_commands.autocomplete(template_name=template_name_autocomplete)    
 @tree.command(name="updatetemplate", description="更新现有模板的参数")
 @app_commands.describe(
-    template_name="要更新的模板名称",
+    template_id="要更新的模板ID",
     new_name="新的模板名称（可选）",
     new_prompt="新的提示词（可选）",
-    new_position="新的提示词位置（可选）",
     new_tags="新的标签（用逗号分隔）（可选）",
     update_params="是否更新为最近一次生成的参数"
 )
-@app_commands.choices(
-    new_position=[
-        app_commands.Choice(name="前缀 - 添加到提示词开头", value="prefix"),
-        app_commands.Choice(name="后缀 - 添加到提示词末尾", value="suffix"),
-        app_commands.Choice(name="替换 - 完全替换提示词", value="replace")
-    ]
-)
 async def updatetemplate_command(
     interaction: discord.Interaction, 
-    template_name: str,
+    template_id: str,
     new_name: str = None,
     new_prompt: str = None,
-    new_position: str = None,
     new_tags: str = None,
     update_params: bool = False
 ):
     user_id = str(interaction.user.id)
     
-    # 按名称查找模板
-    template_id, template = find_template_by_name(
-        template_name, 
-        user_id,
-        interaction.guild_id
-    )
-    
-    if not template:
-        await interaction.response.send_message(f"❌ 未找到名为 \"{template_name}\" 的模板。", ephemeral=True)
+    # 检查模板是否存在
+    if template_id not in prompt_templates:
+        await interaction.response.send_message("❌ 未找到指定的模板。", ephemeral=True)
         return
     
     # 检查是否是创建者
+    template = prompt_templates[template_id]
     if template.get("creator_id") != user_id:
         await interaction.response.send_message("❌ 你不是此模板的创建者，无法更新。", ephemeral=True)
         return
     
-    # 保存旧名称用于更新索引
-    old_name = template.get("name", "").lower()
-    
     # 更新模板
     if new_name:
         template["name"] = new_name
-        # 更新名称索引
-        old_key = (user_id, old_name)
-        new_key = (user_id, new_name.lower())
-        
-        if old_key in prompt_name_index:
-            prompt_name_index[new_key] = prompt_name_index[old_key]
-            del prompt_name_index[old_key]
     
     if new_prompt:
         template["prompt"] = new_prompt
-    
-    if new_position:
-        template["position"] = new_position
     
     if new_tags:
         template["tags"] = [tag.strip() for tag in new_tags.split(",") if tag.strip()]
@@ -2403,9 +2137,6 @@ async def updatetemplate_command(
         update_summary.append(f"• 名称: {new_name}")
     if new_prompt:
         update_summary.append(f"• 提示词: {new_prompt[:50]}..." if len(new_prompt) > 50 else f"• 提示词: {new_prompt}")
-    if new_position:
-        position_text = "前缀" if new_position == "prefix" else "后缀" if new_position == "suffix" else "替换"
-        update_summary.append(f"• 位置: {position_text}")
     if new_tags:
         update_summary.append(f"• 标签: {new_tags}")
     if update_params:
@@ -2415,32 +2146,25 @@ async def updatetemplate_command(
         f"✅ 模板 \"{template['name']}\" 已更新！\n\n" + "\n".join(update_summary),
         ephemeral=True
     )
-    
+
 # ===== 图像生成命令 =====
-@app_commands.autocomplete(template_name=template_name_autocomplete)
 @tree.command(name="nai", description="使用NovelAI生成图像")
 @app_commands.describe(
     prompt="图像生成提示词",
     model="模型选择",
-    size="图像尺寸",
-    template_name="要使用的模板名称（可选）"
+    template_id="要使用的模板ID（可选）"
 )
 @app_commands.choices(
     model=[
         app_commands.Choice(name=f"{model} - {MODEL_DESCRIPTIONS[model]}", value=model)
         for model in AVAILABLE_MODELS
-    ],
-    size=[
-        app_commands.Choice(name=size, value=size)
-        for size in AVAILABLE_SIZES
     ]
 )
 async def nai_command(
     interaction: discord.Interaction, 
     prompt: str = None,
     model: str = None,
-    size: str = None,
-    template_name: str = None
+    template_id: str = None
 ):
     await interaction.response.defer(thinking=True)
     
@@ -2451,33 +2175,30 @@ async def nai_command(
             return
         
         # 处理模板
-        if template_name:
-            # 按名称查找模板
-            template_id, template = find_template_by_name(
-                template_name, 
-                interaction.user.id, 
-                interaction.guild_id
-            )
-            
-            if not template:
-                await interaction.followup.send(f"❌ 未找到名为 \"{template_name}\" 的模板。", ephemeral=True)
+        if template_id:
+            if template_id not in prompt_templates:
+                await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
                 return
                 
-            # 获取位置属性
-            position = template.get("position", "suffix")
-            template_prompt = template.get("prompt", "")
+            template = prompt_templates[template_id]
+            user_id = str(interaction.user.id)
+            guild_id = interaction.guild_id
+            
+            # 检查访问权限
+            is_creator = template.get("creator_id") == user_id
+            is_guild_shared = guild_id in template.get("shared_guilds", [])
+            
+            if not (is_creator or is_guild_shared):
+                await interaction.followup.send("❌ 你没有权限使用此模板。", ephemeral=True)
+                return
                 
             # 如果未提供提示词，使用模板提示词
             if not prompt:
-                prompt = template_prompt
-            elif template_prompt:
-                # 根据位置属性添加提示词
-                if position == "prefix":
-                    prompt = f"{template_prompt}, {prompt}"
-                elif position == "suffix":
-                    prompt = f"{prompt}, {template_prompt}"
-                elif position == "replace":
-                    prompt = template_prompt
+                prompt = template.get("prompt", "")
+            else:
+                # 如果提供了提示词，与模板提示词组合
+                base_prompt = template.get("prompt", "")
+                prompt = f"{base_prompt}, {prompt}"
                 
             # 如果未指定模型，使用模板模型
             if not model and "model" in template:
@@ -2505,9 +2226,9 @@ async def nai_command(
         
         # 获取适合模型的参数
         model_params = None
-        if template_name and template and "params" in template:
+        if template_id and template_id in prompt_templates and "params" in prompt_templates[template_id]:
             # 使用模板参数
-            model_params = template["params"].copy()
+            model_params = prompt_templates[template_id]["params"].copy()
             
             # 调整参数以适应选中的模型
             if model and selected_model.startswith("nai-diffusion-4"):
@@ -2518,15 +2239,6 @@ async def nai_command(
         else:
             # 使用默认参数
             model_params = get_model_default_params(selected_model)
-        
-        # 处理尺寸参数
-        if size and "x" in size:
-            try:
-                width, height = map(int, size.split("x"))
-                model_params["width"] = width
-                model_params["height"] = height
-            except:
-                pass
         
         # 准备API请求
         payload = {
@@ -2555,15 +2267,16 @@ async def nai_command(
             embed.add_field(name="提示词", value=prompt[:1024], inline=False)
             
         embed.add_field(name="模型", value=selected_model, inline=True)
-        embed.add_field(name="尺寸", value=f"{model_params['width']}x{model_params['height']}", inline=True)
         
         # 如果使用模板，显示模板信息
-        if template_name and template:
-            embed.add_field(name="使用模板", value=template.get("name", "未命名模板"), inline=True)
+        if template_id and template_id in prompt_templates:
+            template_name = prompt_templates[template_id].get("name", "未命名模板")
+            embed.add_field(name="使用模板", value=template_name, inline=True)
         
         # 显示参数
         param_text = []
         if model_params:
+            param_text.append(f"尺寸: {model_params.get('width', DEFAULT_SIZE[0])}x{model_params.get('height', DEFAULT_SIZE[1])}")
             param_text.append(f"采样器: {model_params.get('sampler', DEFAULT_SAMPLER)}")
         if param_text:
             embed.add_field(name="参数", value="\n".join(param_text), inline=True)
@@ -2584,8 +2297,7 @@ async def nai_command(
         print(f"生成图像时出错: {str(e)}")
         print(traceback.format_exc())
         await interaction.followup.send(f"❌ 生成图像时出错: {str(e)}")
- 
-@app_commands.autocomplete(template_name=template_name_autocomplete)              
+        
 @tree.command(name="naigen", description="使用NovelAI生成图像 (高级选项)")
 @app_commands.describe(
     prompt="图像生成提示词",
@@ -2602,7 +2314,7 @@ async def nai_command(
     seed="随机种子 (留空为随机)",
     variety_plus="启用Variety+功能",
     legacy_uc="启用legacy_uc功能 (仅v4模型)",
-    template_name="要使用的模板名称 (可选，可与其他参数结合)"
+    template_id="要使用的模板ID (可选，可与其他参数结合)"
 )
 @app_commands.choices(
     model=[
@@ -2622,7 +2334,6 @@ async def nai_command(
         for schedule in AVAILABLE_NOISE_SCHEDULES
     ]
 )
-@app_commands.autocomplete(template_name=template_name_autocomplete)
 async def naigen_command(
     interaction: discord.Interaction, 
     prompt: str = None,
@@ -2639,7 +2350,7 @@ async def naigen_command(
     seed: str = None,
     variety_plus: bool = None,
     legacy_uc: bool = None,
-    template_name: str = None
+    template_id: str = None
 ):
     await interaction.response.defer(thinking=True)
     
@@ -2654,16 +2365,21 @@ async def naigen_command(
         template_model = None
         template_prompt = None
         
-        if template_name:
-            # 按名称查找模板
-            template_id, template = find_template_by_name(
-                template_name, 
-                interaction.user.id, 
-                interaction.guild_id
-            )
+        if template_id:
+            if template_id not in prompt_templates:
+                await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+                return
+                
+            template = prompt_templates[template_id]
+            user_id = str(interaction.user.id)
+            guild_id = interaction.guild_id
             
-            if not template:
-                await interaction.followup.send(f"❌ 未找到名为 \"{template_name}\" 的模板。", ephemeral=True)
+            # 检查访问权限
+            is_creator = template.get("creator_id") == user_id
+            is_guild_shared = guild_id in template.get("shared_guilds", [])
+            
+            if not (is_creator or is_guild_shared):
+                await interaction.followup.send("❌ 你没有权限使用此模板。", ephemeral=True)
                 return
                 
             # 获取模板参数
@@ -2674,21 +2390,15 @@ async def naigen_command(
             if "model" in template:
                 template_model = template["model"]
                 
-            # 获取模板提示词和位置
+            # 获取模板提示词
             template_prompt = template.get("prompt", "")
-            position = template.get("position", "suffix")
             
             # 如果未提供提示词，使用模板提示词
             if not prompt:
                 prompt = template_prompt
-            elif template_prompt:
-                # 根据位置属性组合提示词
-                if position == "prefix":
-                    prompt = f"{template_prompt}, {prompt}"
-                elif position == "suffix":
-                    prompt = f"{prompt}, {template_prompt}"
-                elif position == "replace":
-                    prompt = template_prompt
+            else:
+                # 如果提供了提示词，与模板提示词组合
+                prompt = f"{template_prompt}, {prompt}"
         
         # 确保有提示词
         if not prompt:
@@ -2855,7 +2565,7 @@ async def naigen_command(
         embed.add_field(name="尺寸", value=f"{width}x{height}", inline=True)
         
         # 显示种子值和Variety+状态
-        seed_display = seed_value if not random_seed else f"随机 ({model_params['seed']})"
+        seed_display = seed_value if not random_seed else "随机"
         embed.add_field(name="种子", value=f"{seed_display}", inline=True)
         
         if variety_plus:
@@ -2865,9 +2575,9 @@ async def naigen_command(
             embed.add_field(name="Legacy UC", value="已启用", inline=True)
 
         # 如果使用模板，显示模板信息
-        if template_name and template:
-            position_text = "前缀" if template.get("position") == "prefix" else "后缀" if template.get("position") == "suffix" else "替换"
-            embed.add_field(name="使用模板", value=f"{template.get('name')} ({position_text})", inline=True)
+        if template_id and template_id in prompt_templates:
+            template_name = prompt_templates[template_id].get("name", "未命名模板")
+            embed.add_field(name="使用模板", value=template_name, inline=True)
         
         # 如果使用的是共享密钥，显示提供者信息
         if provider_info:
@@ -2979,14 +2689,13 @@ async def naivariation_command(
     await interaction.followup.send(file=file, embed=embed)
     
 # ===== 批量生成命令 =====
-@app_commands.autocomplete(template_name=template_name_autocomplete)
 @tree.command(name="naibatch", description="提交批量图像生成请求")
 @app_commands.describe(
     prompt="图像提示词模板，使用 {var1} {var2} 语法表示变量",
     variations="变量值列表，格式: var1=值1,值2,值3|var2=值4,值5,值6",
     param_variations="参数变化，格式: model=模型1,模型2|size=832x1216,1024x1024",
     model="默认使用的模型（如不在param_variations中指定）",
-    template_name="要作为基础的模板名称（可选）"
+    template_id="要作为基础的模板ID（可选）"
 )
 @app_commands.choices(
     model=[
@@ -3000,40 +2709,10 @@ async def naibatch_command(
     variations: str = "",
     param_variations: str = "",
     model: str = None,
-    template_name: str = None
+    template_id: str = None
 ):
     # 复用API密钥获取和参数验证逻辑
     await interaction.response.defer(thinking=True)
-    
-    user_id = str(interaction.user.id)
-    today = datetime.datetime.now().strftime("%Y-%m-%d")
-    
-    # 初始化用户今日使用计数
-    if today not in user_batch_limits:
-        user_batch_limits[today] = {}
-    if user_id not in user_batch_limits[today]:
-        user_batch_limits[today][user_id] = 0
-    
-    # 检查是否超过每日限额
-    if user_batch_limits[today][user_id] >= DAILY_BATCH_LIMIT:
-        await interaction.followup.send(
-            f"❌ 你今天的批量生成配额已用完（{DAILY_BATCH_LIMIT}张/天）。请明天再试或使用单张生成。",
-            ephemeral=True
-        )
-        return
-        
-    # 检查用户当前活跃批量任务数
-    active_tasks = 0
-    for task_id in batch_tasks:
-        if user_id in batch_tasks[task_id] and batch_tasks[task_id][user_id]["status"] in ["pending", "processing"]:
-            active_tasks += 1
-    
-    if active_tasks >= MAX_CONCURRENT_BATCHES:
-        await interaction.followup.send(
-            f"❌ 你已有{active_tasks}个进行中的批量任务，超过最大并发数({MAX_CONCURRENT_BATCHES})。请等待当前任务完成。",
-            ephemeral=True
-        )
-        return
     
     api_key, provider_info = await get_api_key(interaction)
     if not api_key:
@@ -3044,19 +2723,21 @@ async def naibatch_command(
     template_model = None
     template_prompt = None
     
-    if template_name:
-        # 按名称查找模板
-        template_id, template = find_template_by_name(
-            template_name, 
-            interaction.user.id, 
-            interaction.guild_id
-        )
+    if template_id:
+        if template_id not in prompt_templates:
+            await interaction.followup.send("❌ 未找到指定的模板。请使用 `/listtemplates` 查看可用模板。", ephemeral=True)
+            return
+            
+        template = prompt_templates[template_id]
+        user_id = str(interaction.user.id)
+        guild_id = interaction.guild_id
         
-        if not template:
-            await interaction.followup.send(
-                f"❌ 未找到名为 \"{template_name}\" 的模板。请使用 `/listtemplates` 查看可用模板。",
-                ephemeral=True
-            )
+        # 检查访问权限
+        is_creator = template.get("creator_id") == user_id
+        is_guild_shared = guild_id in template.get("shared_guilds", [])
+        
+        if not (is_creator or is_guild_shared):
+            await interaction.followup.send("❌ 你没有权限使用此模板。", ephemeral=True)
             return
             
         # 获取模板参数
@@ -3069,17 +2750,13 @@ async def naibatch_command(
             
         # 获取模板提示词
         template_prompt = template.get("prompt", "")
-        position = template.get("position", "suffix")
         
         # 如果未提供提示词，使用模板提示词
         if not prompt:
             prompt = template_prompt
         elif template_prompt:
-            if position == "prefix":
-                prompt = f"{template_prompt}, {prompt}"
-            elif position == "suffix":
-                prompt = f"{prompt}, {template_prompt}"
-            # 对于replace，直接使用template_prompt
+            # 如果提供了提示词，与模板提示词组合
+            prompt = f"{template_prompt}, {prompt}"
     
     # 确保有提示词
     if not prompt:
@@ -3088,9 +2765,9 @@ async def naibatch_command(
     
     # 选择模型的优先级：用户指定 > 模板指定 > 默认
     selected_model = model if model else template_model if template_model else DEFAULT_MODEL
-    
+        
     try:
-        # 解析变量定义，添加变量数量限制
+        # 解析变量定义
         var_definitions = {}
         for part in variations.split('|'):
             if '=' not in part:
@@ -3099,15 +2776,6 @@ async def naibatch_command(
             var_name, var_values = part.split('=', 1)
             var_name = var_name.strip()
             var_values = [v.strip() for v in var_values.split(',')]
-            
-            # 添加每个变量的值数量限制
-            if len(var_values) > MAX_VARIATIONS_PER_VARIABLE:
-                await interaction.followup.send(
-                    f"⚠️ 变量'{var_name}'的值数量超过限制({MAX_VARIATIONS_PER_VARIABLE}个)，只会使用前{MAX_VARIATIONS_PER_VARIABLE}个值。",
-                    ephemeral=True
-                )
-                var_values = var_values[:MAX_VARIATIONS_PER_VARIABLE]
-                
             var_definitions[var_name] = var_values
         
         # 解析参数变化
@@ -3120,15 +2788,6 @@ async def naibatch_command(
                 param_name, param_values = part.split('=', 1)
                 param_name = param_name.strip().lower()
                 param_values = [v.strip() for v in param_values.split(',')]
-                
-                # 同样限制参数变量的值数量
-                if len(param_values) > MAX_VARIATIONS_PER_VARIABLE:
-                    await interaction.followup.send(
-                        f"⚠️ 参数'{param_name}'的值数量超过限制({MAX_VARIATIONS_PER_VARIABLE}个)，只会使用前{MAX_VARIATIONS_PER_VARIABLE}个值。",
-                        ephemeral=True
-                    )
-                    param_values = param_values[:MAX_VARIATIONS_PER_VARIABLE]
-                    
                 param_var_definitions[param_name] = param_values
         
         # 生成所有可能的组合
@@ -3168,25 +2827,15 @@ async def naibatch_command(
                 param_combinations = param_combinations[:max_param_combinations]
                 total_combinations = len(prompt_combinations) * len(param_combinations)
         
-        # 检查批量生成配额
-        if user_batch_limits[today][user_id] + total_combinations > DAILY_BATCH_LIMIT:
-            remaining = DAILY_BATCH_LIMIT - user_batch_limits[today][user_id]
-            await interaction.followup.send(
-                f"⚠️ 此批量任务需要生成 {total_combinations} 张图像，但你今天只剩余 {remaining} 张配额。请减少变量组合或明天再试。",
-                ephemeral=True
-            )
-            return
-            
         # 创建批量任务ID
         task_id = f"batch_{int(time.time())}"
+        user_id = str(interaction.user.id)
         
         if task_id not in batch_tasks:
             batch_tasks[task_id] = {}
             
         # 准备批处理队列
         batch_requests = []
-        
-        # 其余批量处理代码...
         
         # 生成所有组合的请求
         for prompt_idx, prompt_combo in enumerate(prompt_combinations):
@@ -3298,16 +2947,12 @@ async def naibatch_command(
         # 启动处理任务
         client.loop.create_task(process_batch_task(task_id, user_id))
         
-        # 更新用户的批量生成计数
-        user_batch_limits[today][user_id] += total_combinations
-        
         await interaction.followup.send(
             f"✅ 已创建批量生成任务 `{task_id}`\n"
             f"• 提示词模板: {prompt}\n"
             f"• 提示词变量组合数: {len(prompt_combinations)}\n"
             f"• 参数变量组合数: {len(param_combinations)}\n"
             f"• 总生成图像数: {total_combinations}\n"
-            f"• 今日剩余配额: {DAILY_BATCH_LIMIT - user_batch_limits[today][user_id]}张\n"
             f"• 状态: 队列处理中\n\n"
             f"使用 `/batchstatus {task_id}` 查看任务进度。",
             ephemeral=True
@@ -4020,55 +3665,18 @@ async def update_command(interaction: discord.Interaction, branch: str = "main",
 @app_commands.describe(
     prompt="图像提示词模板，使用 {var1} {var2} 语法表示变量",
     variations="变量值列表，格式: var1=值1,值2,值3|var2=值4,值5,值6",
-    param_variations="参数变化，格式: model=模型1,模型2|size=832x1216,1024x1024",
-    template_name="要作为基础的模板名称（可选）"
+    param_variations="参数变化，格式: model=模型1,模型2|size=832x1216,1024x1024"
 )
-@app_commands.autocomplete(template_name=template_name_autocomplete)
 async def previewbatch_command(
     interaction: discord.Interaction, 
-    prompt: str = None,
+    prompt: str,
     variations: str = "",
-    param_variations: str = "",
-    template_name: str = None
+    param_variations: str = ""
 ):
     await interaction.response.defer(thinking=True)
     
-    # 处理模板
-    if template_name:
-        # 按名称查找模板
-        template_id, template = find_template_by_name(
-            template_name, 
-            interaction.user.id, 
-            interaction.guild_id
-        )
-        
-        if not template:
-            await interaction.followup.send(f"❌ 未找到名为 \"{template_name}\" 的模板。", ephemeral=True)
-            return
-            
-        # 获取模板提示词和位置
-        template_prompt = template.get("prompt", "")
-        position = template.get("position", "suffix")
-        
-        # 如果未提供提示词，使用模板提示词
-        if not prompt:
-            prompt = template_prompt
-        elif template_prompt:
-            # 根据位置属性组合提示词
-            if position == "prefix":
-                prompt = f"{template_prompt}, {prompt}"
-            elif position == "suffix":
-                prompt = f"{prompt}, {template_prompt}"
-            elif position == "replace":
-                prompt = template_prompt
-    
-    # 确保有提示词
-    if not prompt:
-        await interaction.followup.send("❌ 必须提供提示词或有效的模板。", ephemeral=True)
-        return
-    
     try:
-        # 解析变量定义，添加变量限制
+        # 解析变量定义
         var_definitions = {}
         for part in variations.split('|'):
             if '=' not in part:
@@ -4077,18 +3685,9 @@ async def previewbatch_command(
             var_name, var_values = part.split('=', 1)
             var_name = var_name.strip()
             var_values = [v.strip() for v in var_values.split(',')]
-            
-            # 添加变量值数量限制警告
-            if len(var_values) > MAX_VARIATIONS_PER_VARIABLE:
-                await interaction.followup.send(
-                    f"⚠️ 变量'{var_name}'的值数量超过限制({MAX_VARIATIONS_PER_VARIABLE}个)，只会使用前{MAX_VARIATIONS_PER_VARIABLE}个值。",
-                    ephemeral=True
-                )
-                var_values = var_values[:MAX_VARIATIONS_PER_VARIABLE]
-                
             var_definitions[var_name] = var_values
         
-        # 同样处理参数变量限制
+        # 解析参数变化
         param_var_definitions = {}
         if param_variations:
             for part in param_variations.split('|'):
@@ -4098,14 +3697,6 @@ async def previewbatch_command(
                 param_name, param_values = part.split('=', 1)
                 param_name = param_name.strip().lower()
                 param_values = [v.strip() for v in param_values.split(',')]
-                
-                if len(param_values) > MAX_VARIATIONS_PER_VARIABLE:
-                    await interaction.followup.send(
-                        f"⚠️ 参数'{param_name}'的值数量超过限制({MAX_VARIATIONS_PER_VARIABLE}个)，只会使用前{MAX_VARIATIONS_PER_VARIABLE}个值。",
-                        ephemeral=True
-                    )
-                    param_values = param_values[:MAX_VARIATIONS_PER_VARIABLE]
-                    
                 param_var_definitions[param_name] = param_values
         
         # 生成所有可能的组合
@@ -4133,32 +3724,6 @@ async def previewbatch_command(
         
         # 计算总组合数
         total_combinations = len(prompt_combinations) * len(param_combinations)
-        
-        # 检查配额限制
-        user_id = str(interaction.user.id)
-        today = datetime.datetime.now().strftime("%Y-%m-%d")
-        
-        # 初始化用户今日使用计数
-        if today not in user_batch_limits:
-            user_batch_limits[today] = {}
-        if user_id not in user_batch_limits[today]:
-            user_batch_limits[today][user_id] = 0
-        
-        remaining_quota = DAILY_BATCH_LIMIT - user_batch_limits[today][user_id]
-        quota_warning = ""
-        if total_combinations > remaining_quota:
-            quota_warning = f"⚠️ 这个批量任务将超出今日剩余配额! (需要: {total_combinations}, 剩余: {remaining_quota})"
-        
-        if total_combinations > 20:
-            await interaction.followup.send(f"⚠️ 你定义了 {total_combinations} 个组合，超过最大限制(20个)。只会预览前20个。", ephemeral=True)
-            # 限制组合数，优先保持提示词变量的多样性
-            if len(prompt_combinations) > 20:
-                prompt_combinations = prompt_combinations[:20]
-                total_combinations = len(prompt_combinations)
-            else:
-                max_param_combinations = 20 // len(prompt_combinations)
-                param_combinations = param_combinations[:max_param_combinations]
-                total_combinations = len(prompt_combinations) * len(param_combinations)
         
         # 预览所有组合
         combinations_preview = []
@@ -4211,25 +3776,11 @@ async def previewbatch_command(
         
         if combinations_preview:
             embed.add_field(name="组合示例", value=preview_text, inline=False)
-            
-        # 添加配额信息
-        embed.add_field(
-            name="配额信息", 
-            value=f"今日已用: {user_batch_limits[today].get(user_id, 0)}/{DAILY_BATCH_LIMIT}\n" +
-                  f"此任务需要: {total_combinations}\n" +
-                  f"剩余: {remaining_quota}\n" +
-                  (quota_warning if quota_warning else "✅ 配额充足"),
-            inline=False
-        )
         
-        # 生成指令部分添加模板名称
+        # 添加使用说明
         embed.add_field(
             name="生成指令",
-            value=f"使用 `/naibatch prompt=\"{prompt}\" " +
-                  f"variations=\"{variations}\" " +
-                  f"param_variations=\"{param_variations}\" " +
-                  (f"template_name=\"{template_name}\" " if template_name else "") +
-                  "` 来开始批量生成。",
+            value=f"使用 `/naibatch` 命令并传入相同参数来开始批量生成。",
             inline=False
         )
         
@@ -4239,7 +3790,7 @@ async def previewbatch_command(
         print(f"预览批量生成时出错: {str(e)}")
         print(traceback.format_exc())
         await interaction.followup.send(f"❌ 预览批量生成时出错: {str(e)}")
-        
+
 # ===== 帮助命令 =====
 @tree.command(name="help", description="显示帮助信息")
 async def help_command(interaction: discord.Interaction):
@@ -4252,10 +3803,10 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="🖼️ 图像生成命令",
         value=(
-            "• `/nai [prompt] [model] [size] [template_name]` - 使用基础设置快速生成图像\n"
-            "• `/naigen [prompt] [options...] [template_name]` - 使用高级设置生成图像\n"
+            "• `/nai [prompt] [model] [template_id]` - 使用基础设置快速生成图像\n"
+            "• `/naigen [prompt] [options...] [template_id]` - 使用高级设置生成图像\n"
             "• `/naivariation [index] [type]` - 基于最近生成的图像创建变体\n"
-            "• `/naibatch [prompt] [variations] [param_variations] [template_name]` - 批量生成多个变体图像\n"
+            "• `/naibatch [prompt] [variations] [param_variations]` - 批量生成多个变体图像\n"
             "• `/previewbatch [prompt] [variations]` - 预览批量生成而不实际生成图像\n"
             "• `/batchstatus [task_id]` - 查看批量生成任务状态\n"
             "• `/cancelbatch [task_id]` - 取消批量生成任务\n"
@@ -4267,11 +3818,11 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="📝 提示词模板",
         value=(
-            "• `/savetemplate [name] [prompt] [position] [save_params]` - 保存提示词模板\n"
+            "• `/savetemplate [name] [prompt] [save_params]` - 保存提示词模板\n"
             "• `/listtemplates [filter_tags]` - 查看可用的提示词模板\n"
-            "• `/usetemplate [template_name] [override_prompt]` - 使用模板生成图像\n"
-            "• `/updatetemplate [template_name] [new_params]` - 更新现有模板\n"
-            "• `/deletetemplate [template_name]` - 删除你创建的模板"
+            "• `/usetemplate [id] [override_prompt]` - 使用模板生成图像\n"
+            "• `/updatetemplate [id] [new_params]` - 更新现有模板\n"
+            "• `/deletetemplate [id]` - 删除你创建的模板"
         ),
         inline=False
     )
@@ -4300,11 +3851,10 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(
         name="⭐ 新功能与改进",
         value=(
-            "• **模板增强**: 现在可以直接用名称而非ID引用模板\n"
-            "• **模板位置**: 模板可设置为前缀、后缀或替换原提示词\n"
-            "• **批量限制**: 每用户每日批量生成有上限，避免滥用\n"
-            "• **尺寸设置**: 基础/nai命令现可直接指定尺寸\n"
-            "• **自动补全**: 模板名称支持自动补全，无需记忆ID\n"
+            "• **模板增强**: 模板现在可以保存完整参数并与其他命令结合使用\n"
+            "• **批量生成扩展**: 支持同时变化提示词和生成参数\n"
+            "• **接力生成改进**: 修复内容添加后的消息更新问题\n"
+            "• **预览功能**: 可以预览批量生成的组合而不实际生成图像\n"
             "• **翻译功能**: 使用中文生成图像吧！"
         ),
         inline=False
@@ -4318,7 +3868,7 @@ async def help_command(interaction: discord.Interaction):
     )
     
     await interaction.response.send_message(embed=embed)
-    
+
 # ===== 主函数 =====
 if __name__ == "__main__":
     # 使用配置文件中的令牌，如果没有则尝试从环境变量获取
