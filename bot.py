@@ -4015,6 +4015,49 @@ async def update_command(interaction: discord.Interaction, branch: str = "main",
     except Exception as e:
         await interaction.followup.send(f"❌ 更新过程中出错: {str(e)}\n{traceback.format_exc()}")
 
+# ===== 重启命令 =====
+@tree.command(name="restart", description="重启机器人（仅管理员可用）")
+@app_commands.describe(
+    save_data="是否在重启前保存数据"
+)
+async def restart_command(interaction: discord.Interaction, save_data: bool = True):
+    # 检查权限(只允许机器人管理员使用)
+    user_id = str(interaction.user.id)
+    
+    if not BOT_ADMIN_IDS or user_id not in BOT_ADMIN_IDS:
+        await interaction.response.send_message("❌ 你没有权限执行重启操作。", ephemeral=True)
+        return
+    
+    await interaction.response.defer(thinking=True)
+    
+    try:
+        # 保存数据
+        if save_data:
+            await interaction.followup.send("正在保存数据...", ephemeral=True)
+            save_api_keys_to_file()
+            save_templates_to_file()
+            save_batch_limits_to_file()
+            
+            await interaction.followup.send("✅ 数据保存完成!", ephemeral=True)
+            
+        # 发送重启消息
+        await interaction.followup.send(
+            f"🔄 机器人正在重启...\n"
+            f"• 启动时间: {BOT_START_TIME.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"• 当前版本: v{VERSION}\n"
+            f"• 执行者: {interaction.user.display_name}\n\n"
+            f"机器人将在5秒后重启。"
+        )
+        
+        # 延迟5秒
+        await asyncio.sleep(5)
+        
+        # 重启程序
+        os.execv(sys.executable, ['python'] + sys.argv)
+        
+    except Exception as e:
+        await interaction.followup.send(f"❌ 重启过程中出错: {str(e)}\n{traceback.format_exc()}")
+        
 # ===== 预览批量生成 =====
 @tree.command(name="previewbatch", description="预览批量生成的组合而不实际生成图像")
 @app_commands.describe(
@@ -4328,10 +4371,25 @@ if __name__ == "__main__":
         exit(1)
     
     # 显示已加载的配置
+    print(f"======= NovelAI Discord Bot v{VERSION} =======")
     print(f"已加载配置:")
     print(f"- 默认模型: {DEFAULT_MODEL}")
     print(f"- 默认尺寸: {DEFAULT_SIZE}")
     print(f"- 默认步数: {DEFAULT_STEPS}")
+    print(f"- 默认采样器: {DEFAULT_SAMPLER}")
+    print(f"- 默认CFG比例: {DEFAULT_SCALE}")
+    print(f"- 默认噪声调度: {DEFAULT_NOISE_SCHEDULE}")
+    print(f"- 批量生成每日限制: {DAILY_BATCH_LIMIT}张/用户")
+    print(f"- 翻译功能: {'已启用 (' + TRANSLATION_API + ')' if ENABLE_TRANSLATION else '已禁用'}")
+    
+    # 显示管理员信息
+    if BOT_ADMIN_IDS and BOT_ADMIN_IDS[0]:
+        admin_count = len([admin_id for admin_id in BOT_ADMIN_IDS if admin_id])
+        print(f"- 已配置 {admin_count} 个管理员ID")
+    else:
+        print("- 警告: 未配置管理员ID，管理员命令将无法使用")
+    
+    print(f"========================================")
     
     # 运行Discord机器人
     client.run(TOKEN)
