@@ -25,6 +25,7 @@ prompt_name_index = {}  # 名称索引：(user_id, name) -> template_id
 # 使用跟踪
 key_usage_counter = {}
 key_last_used = {}
+key_in_use = {}  # 跟踪每个API密钥是否正在使用
 # 图像历史和生成队列
 recent_generations = {}
 generation_queues = {}
@@ -672,7 +673,7 @@ async def translate_with_google_ai(text: str, from_lang="zh", to_lang="en") -> T
         
 # ===== API请求处理 =====
 async def send_novelai_request(api_key, payload, interaction, retry_count=0):
-    """使用改进的错误处理逻辑发送NovelAI API请求"""
+    """使用改进的错误处理逻辑发送NovelAI API请求，处理429错误"""
     max_retries = 1
     
     # 验证API密钥格式
@@ -769,10 +770,20 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
             return None
         
         elif response.status_code == 429:
-            await interaction.followup.send(
-                "❌ 请求频率限制(429): 您发送了太多请求。请等待一段时间后再试。"
-            )
-            return None
+            # 429表示密钥正在使用，等待几秒后重试
+            if retry_count < 3:  # 最多重试3次
+                await interaction.followup.send(
+                    f"⚠️ API密钥正在被使用(429)，正在等待并重试...(尝试 {retry_count+1}/3)",
+                    ephemeral=True
+                )
+                # 等待时间逐次增加
+                await asyncio.sleep(5 + retry_count * 3)
+                return await send_novelai_request(api_key, payload, interaction, retry_count + 1)
+            else:
+                await interaction.followup.send(
+                    "❌ API密钥一直被占用。请稍后再试，或使用另一个API密钥。"
+                )
+                return None
         
         elif response.status_code == 500:
             # 500错误可能是参数问题，尝试使用更简单的参数重试
@@ -1137,7 +1148,13 @@ async def check_internet_connection():
 
 # 改进 API 密钥有效性检查
 async def check_api_key_validity(api_key, max_retries=2, retry_delay=3):
-    """检查API密钥是否有效，带有重试机制"""
+    """检查API密钥是否有效，带有重试机制，正确处理429状态码"""
+    # 如果密钥正在使用中，直接返回有效
+    global key_in_use
+    if api_key in key_in_use and key_in_use[api_key]:
+        print(f"密钥正在使用中，跳过验证")
+        return True
+    
     test_payload = {
         "input": "test",
         "model": "nai-diffusion-3",
@@ -1180,6 +1197,11 @@ async def check_api_key_validity(api_key, max_retries=2, retry_delay=3):
                 
             if response.status_code == 200:
                 # 确定有效
+                return True
+                
+            if response.status_code == 429:
+                # 密钥正在使用，视为有效
+                print(f"密钥返回429(正在使用)，视为有效")
                 return True
                 
             # 其他状态码可能是临时性问题，继续重试
@@ -1251,6 +1273,7 @@ async def hourly_validate_keys():
         # 移除无效密钥
         for user_id in invalid_keys:
             if user_id in api_keys:  # 再次检查，因为可能在循环过程中被修改
+                print(f"移除无效密钥: {user_id}")
                 # 如果是持久化密钥，从文件中也删除
                 was_persistent = api_keys[user_id].get("persist", False)
                 del api_keys[user_id]
@@ -1275,6 +1298,7 @@ async def hourly_validate_keys():
                         print(f"从文件中删除无效密钥时出错: {str(e)}")
         
         print(f"[{datetime.datetime.now()}] API密钥检查完成，检查了 {checked_count} 个密钥，移除了 {len(invalid_keys)} 个无效密钥")
+
 
 # 定期清理过期的批量限制
 async def cleanup_batch_limits():
@@ -1323,19 +1347,32 @@ async def check_expired_keys():
 
 # 队列处理器
 async def queue_processor():
-    """持续处理所有队列中的请求"""
+    """持续处理所有队列中的请求，确保同一个API密钥不会同时使用"""
+    global key_in_use
+    
     while True:
         processed = False
         
         # 处理所有活跃队列
         for queue_id, queue_data in list(generation_queues.items()):
             if queue_data["queue"] and not queue_data["processing"]:
+                # 获取队列头部的请求
+                request = queue_data["queue"][0]
+                api_key = request.get("api_key")
+                
+                # 检查此API密钥是否正在使用中
+                if api_key in key_in_use and key_in_use[api_key]:
+                    # 跳过此队列，尝试下一个队列
+                    continue
+                
                 # 标记为处理中
                 queue_data["processing"] = True
                 
                 try:
+                    # 标记API密钥为正在使用
+                    key_in_use[api_key] = True
+                    
                     # 处理队列头部的请求
-                    request = queue_data["queue"][0]
                     await process_queued_request(request)
                     processed = True
                 except Exception as e:
@@ -1346,6 +1383,9 @@ async def queue_processor():
                     except:
                         pass
                 finally:
+                    # 标记API密钥为不在使用
+                    key_in_use[api_key] = False
+                    
                     # 移除已处理的请求
                     queue_data["queue"].pop(0)
                     queue_data["processing"] = False
