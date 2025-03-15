@@ -3,7 +3,21 @@
 config.txt
 api_keys.json
 prompt_templates.json
+template_name_index.json
+batch_limits.json
 
+# 备份文件夹
+backup_*/
+
+# 生成的数据文件夹
+data/
+
+# 临时生成文件
+*.png
+*.jpg
+*.jpeg
+*.zip
+*.log
 
 # Python缓存文件
 __pycache__/
