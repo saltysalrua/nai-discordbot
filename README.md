@@ -10,6 +10,7 @@
 
 ## 如何使用
 - 获取discord token(网上有教程)
+- **需要python3.9以上**
 - git clone后运行start.sh，安装依赖，并根据提示修改config.txt
 - 开始享受吧，之后启动只需要使用`python bot.py`
 
