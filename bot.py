@@ -3939,7 +3939,7 @@ async def update_command(interaction: discord.Interaction, branch: str = "main",
             
         # 显示更新信息
         commits_between = list(repo.iter_commits(f"{current_commit.hexsha}..{remote_commit.hexsha}"))
-        update_info = "\n".join([f"• {commit.message.split('\n')[0]}" for commit in commits_between[:5]])
+        update_info = "\n".join([f"• {commit.message.split('\\n')[0]}" for commit in commits_between[:5]])
         
         if len(commits_between) > 5:
             update_info += f"\n• ...以及另外 {len(commits_between) - 5} 条提交"
