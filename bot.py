@@ -602,7 +602,7 @@ async def translate_with_google_ai(text: str, from_lang="zh", to_lang="en") -> T
     
     # 构建API请求URL - Gemini API格式
     model = GOOGLE_AI_MODEL_NAME  # 从配置中获取模型名称，例如 "gemini-pro"
-    url = f"https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={GOOGLE_AI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GOOGLE_AI_API_KEY}"
     
     # 构建翻译提示
     if to_lang == "en":
@@ -770,19 +770,64 @@ async def send_novelai_request(api_key, payload, interaction, retry_count=0):
             return None
         
         elif response.status_code == 429:
-            # 429表示密钥正在使用，等待几秒后重试
-            if retry_count < 3:  # 最多重试3次
+            # 429表示密钥正在使用，不再多次重试，而是直接加入队列
+            if retry_count < 1:  # 只尝试重试一次
                 await interaction.followup.send(
-                    f"⚠️ API密钥正在被使用(429)，正在等待并重试...(尝试 {retry_count+1}/3)",
+                    "⚠️ API密钥正在被使用(429)，正在等待并重试一次...",
                     ephemeral=True
                 )
-                # 等待时间逐次增加
-                await asyncio.sleep(5 + retry_count * 3)
+                await asyncio.sleep(3)  # 短暂等待
                 return await send_novelai_request(api_key, payload, interaction, retry_count + 1)
             else:
+                # 如果重试仍然失败，将请求加入队列处理
+                user_id = str(interaction.user.id)
+                queue_id = f"{user_id}_{int(time.time())}"
+                
+                if queue_id not in generation_queues:
+                    generation_queues[queue_id] = {
+                        "queue": [],
+                        "processing": False,
+                        "last_processed": None
+                    }
+                
+                # 获取用户原始提示词信息（如果有）
+                was_translated = False
+                original_prompt = ""
+                
+                # 尝试从请求payload中获取信息
+                if "input" in payload:
+                    for user_record in recent_generations.get(user_id, []):
+                        if "payload" in user_record and user_record["payload"].get("input") == payload["input"]:
+                            original_prompt = getattr(user_record, "original_prompt", "")
+                            was_translated = original_prompt != ""
+                            break
+                
+                # 创建队列请求对象
+                request = {
+                    "interaction": interaction,
+                    "api_key": api_key,
+                    "payload": payload,
+                    "provider_info": "自动队列",  # 简化提供者信息
+                    "is_batch": False,
+                    "batch_index": 0,
+                    "batch_total": 1,
+                    "original_prompt": original_prompt,
+                    "was_translated": was_translated
+                }
+                
+                # 添加到队列
+                generation_queues[queue_id]["queue"].append(request)
+                
+                # 通知用户
+                queue_position = sum(len(q["queue"]) for q in generation_queues.values())
                 await interaction.followup.send(
-                    "❌ API密钥一直被占用。请稍后再试，或使用另一个API密钥。"
+                    f"⏱️ API密钥当前正忙，您的请求已自动加入队列（当前位置：{queue_position}）\n"
+                    f"无需重新提交，系统将自动处理您的请求。\n"
+                    f"提示：您可以考虑使用`/apikey`注册自己的API密钥以避免排队。",
+                    ephemeral=True
                 )
+                
+                # 返回特殊值表示已加入队列
                 return None
         
         elif response.status_code == 500:
@@ -1346,6 +1391,7 @@ async def check_expired_keys():
                 save_api_keys_to_file()
 
 # 队列处理器
+# 优化队列处理器
 async def queue_processor():
     """持续处理所有队列中的请求，确保同一个API密钥不会同时使用"""
     global key_in_use
@@ -1391,15 +1437,40 @@ async def queue_processor():
                     queue_data["processing"] = False
                     queue_data["last_processed"] = datetime.datetime.now()
                 
+                # 添加通知，如果队列中还有请求，告知用户
+                try:
+                    if queue_data["queue"]:
+                        requests_left = len(queue_data["queue"])
+                        interaction = queue_data["queue"][0].get("interaction")
+                        if interaction:
+                            await interaction.followup.send(
+                                f"⏱️ 您的请求即将处理，队列中还有 {requests_left} 个请求在您之前。",
+                                ephemeral=True
+                            )
+                except Exception as e:
+                    print(f"发送队列通知时出错: {str(e)}")
+                
                 # 避免过快处理所有请求
                 break  
         
+        # 清理空队列
+        empty_queues = [
+            q_id for q_id, q_data in generation_queues.items() 
+            if not q_data["queue"] and q_data.get("last_processed") and 
+            (datetime.datetime.now() - q_data["last_processed"]).total_seconds() > 300  # 5分钟前处理完的空队列
+        ]
+        for q_id in empty_queues:
+            if q_id in generation_queues:
+                del generation_queues[q_id]
+                print(f"已清理空队列: {q_id}")
+                
         # 调整等待时间，避免无限循环消耗资源
         if not processed:
             await asyncio.sleep(1)
         else:
             await asyncio.sleep(3)  # 请求间隔，避免API限制
 
+# 增强队列请求处理函数
 async def process_queued_request(request):
     """处理队列中的单个请求"""
     interaction = request.get("interaction")
@@ -1409,6 +1480,17 @@ async def process_queued_request(request):
     is_batch = request.get("is_batch", False)
     batch_index = request.get("batch_index", 0)
     batch_total = request.get("batch_total", 1)
+    
+    # 检查交互是否仍然有效
+    try:
+        # 尝试发送一个临时消息来测试交互是否有效
+        await interaction.followup.send("⏳ 正在处理您排队的请求...", ephemeral=True)
+    except discord.errors.NotFound:
+        print("交互已过期，跳过处理")
+        return
+    except Exception as e:
+        print(f"测试交互时出错: {str(e)}")
+        # 继续尝试处理，即使无法发送消息
     
     # 复用现有的API请求处理函数
     image_data = await send_novelai_request(api_key, payload, interaction)
@@ -1440,8 +1522,12 @@ async def process_queued_request(request):
     if provider_info:
         embed.add_field(name="🔑 API密钥", value=provider_info, inline=True)
         
+    # 添加队列处理信息
+    current_time = datetime.datetime.now().strftime("%H:%M:%S")
+    embed.add_field(name="处理时间", value=current_time, inline=True)
+    
     embed.set_image(url=f"attachment://queued_image_{int(time.time())}.png")
-    embed.set_footer(text=f"由 {interaction.user.display_name} 生成")
+    embed.set_footer(text=f"由 {interaction.user.display_name} 生成 | 队列处理")
     
     await interaction.followup.send(file=file, embed=embed)
     
@@ -3824,6 +3910,83 @@ async def checkapi_command(interaction: discord.Interaction):
     
     await interaction.followup.send(embed=embed)
 
+@tree.command(name="queuestatus", description="查看当前的队列状态")
+async def queuestatus_command(interaction: discord.Interaction):
+    """显示当前队列状态的命令"""
+    # 收集队列数据
+    total_queues = len(generation_queues)
+    active_queues = len([q for q_id, q in generation_queues.items() if q["queue"]])
+    total_requests = sum(len(q["queue"]) for q_id, q in generation_queues.items())
+    
+    # 检查用户自己的队列情况
+    user_id = str(interaction.user.id)
+    user_queues = [
+        (q_id, q) for q_id, q in generation_queues.items() 
+        if q_id.startswith(f"{user_id}_") and q["queue"]
+    ]
+    user_requests = sum(len(q["queue"]) for _, q in user_queues)
+    
+    # 检查队列中用户的位置
+    user_position = None
+    for q_id, q in user_queues:
+        if q["queue"] and q["queue"][0].get("interaction").user.id == interaction.user.id:
+            # 找到用户在总队列中的位置
+            position = 1  # 起始位置为1
+            for other_q_id, other_q in generation_queues.items():
+                # 如果另一个队列已经在处理中，且不是用户自己的队列，那么用户需要等待它完成
+                if other_q_id != q_id and other_q["processing"]:
+                    position += 1
+            user_position = position
+            break
+    
+    # 创建嵌入消息
+    embed = discord.Embed(
+        title="队列状态",
+        description=f"当前共有 {total_queues} 个队列，其中 {active_queues} 个活跃队列",
+        color=0x3498db
+    )
+    
+    embed.add_field(name="总请求数", value=f"{total_requests} 个请求等待处理", inline=True)
+    
+    # 添加API密钥使用情况
+    keys_in_use = sum(1 for k, v in key_in_use.items() if v)
+    embed.add_field(name="API密钥使用情况", value=f"{keys_in_use} 个密钥正在使用中", inline=True)
+    
+    # 添加用户自己的请求信息
+    if user_queues:
+        embed.add_field(
+            name="您的队列",
+            value=f"您有 {user_requests} 个请求在队列中" + 
+                 (f"\n您的位置: {user_position}" if user_position else ""),
+            inline=False
+        )
+    else:
+        embed.add_field(name="您的队列", value="您没有请求在队列中", inline=False)
+    
+    # 添加预估等待时间
+    average_processing_time = 5  # 假设平均每个请求需要5秒
+    if user_position:
+        estimated_wait = user_position * average_processing_time
+        embed.add_field(
+            name="预估等待时间",
+            value=f"约 {estimated_wait} 秒",
+            inline=True
+        )
+    
+    # 添加队列说明
+    embed.add_field(
+        name="队列说明",
+        value=(
+            "• 当多个用户使用同一API密钥时，请求会自动排队\n"
+            "• 429错误表示API密钥正在使用中，系统会自动将请求加入队列\n"
+            "• 注册自己的API密钥可以避免排队\n"
+            "• 队列按先来先服务原则处理"
+        ),
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    
 @tree.command(name="botstatus", description="检查机器人的当前状态和性能")
 async def botstatus_command(interaction: discord.Interaction):
     # 延迟响应，告诉Discord我们需要更多时间
@@ -4097,7 +4260,315 @@ async def restart_command(interaction: discord.Interaction, save_data: bool = Tr
         
     except Exception as e:
         await interaction.followup.send(f"❌ 重启过程中出错: {str(e)}\n{traceback.format_exc()}")
+  
+# ===== 翻译指令 =====
+@tree.command(name="translationconfig", description="查看或更改翻译设置")
+@app_commands.describe(
+    action="要执行的操作",
+    api="要使用的翻译API",
+    status="启用或禁用翻译功能",
+    api_key="API密钥",
+    app_id="应用ID",
+    app_key="应用密钥",
+    region="区域",
+    api_base="API基础URL",
+    model_name="模型名称"
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="查看当前设置", value="view"),
+        app_commands.Choice(name="更改翻译API", value="change_api"),
+        app_commands.Choice(name="启用/禁用翻译", value="toggle"),
+        app_commands.Choice(name="更新API密钥设置", value="update_keys"),
+        app_commands.Choice(name="清除翻译缓存", value="clear_cache")
+    ],
+    api=[
+        app_commands.Choice(name="百度翻译", value="baidu"),
+        app_commands.Choice(name="有道翻译", value="youdao"),
+        app_commands.Choice(name="Azure翻译", value="azure"),
+        app_commands.Choice(name="OpenAI", value="openai"),
+        app_commands.Choice(name="Google AI", value="google")
+    ],
+    status=[
+        app_commands.Choice(name="启用", value="enable"),
+        app_commands.Choice(name="禁用", value="disable")
+    ]
+)
+async def translationconfig_command(
+    interaction: discord.Interaction, 
+    action: str,
+    api: str = None,
+    status: str = None,
+    api_key: str = None,
+    app_id: str = None,
+    app_key: str = None,
+    region: str = None,
+    api_base: str = None,
+    model_name: str = None
+):
+    # 检查权限(只允许机器人管理员使用)
+    user_id = str(interaction.user.id)
+    
+    if not BOT_ADMIN_IDS or user_id not in BOT_ADMIN_IDS:
+        await interaction.response.send_message("❌ 你没有权限更改翻译设置。", ephemeral=True)
+        return
+    
+    # 使用global声明全局变量，以便修改它们
+    global ENABLE_TRANSLATION, TRANSLATION_API
+    global BAIDU_APPID, BAIDU_KEY, BAIDU_API_URL
+    global YOUDAO_APPID, YOUDAO_APPKEY, YOUDAO_API_URL
+    global AZURE_KEY, AZURE_REGION
+    global OPENAI_API_KEY, OPENAI_API_BASE, OPENAI_MODEL_NAME
+    global GOOGLE_AI_API_KEY, GOOGLE_AI_MODEL_NAME
+    
+    if action == "view":
+        # 显示当前翻译设置
+        embed = discord.Embed(
+            title="📝 当前翻译设置",
+            color=0x3498db
+        )
         
+        status_text = "✅ 已启用" if ENABLE_TRANSLATION else "❌ 已禁用"
+        embed.add_field(name="翻译功能", value=status_text, inline=False)
+        embed.add_field(name="当前API", value=TRANSLATION_API, inline=False)
+        
+        # 根据当前API显示详细设置
+        if TRANSLATION_API == "baidu":
+            embed.add_field(name="百度翻译设置", value=(
+                f"AppID: `{BAIDU_APPID[:4]}...` (隐藏)\n"
+                f"密钥: `{BAIDU_KEY[:4]}...` (隐藏)\n"
+                f"API URL: {BAIDU_API_URL}"
+            ), inline=False)
+        elif TRANSLATION_API == "youdao":
+            embed.add_field(name="有道翻译设置", value=(
+                f"应用ID: `{YOUDAO_APPID[:4]}...` (隐藏)\n"
+                f"应用密钥: `{YOUDAO_APPKEY[:4]}...` (隐藏)\n"
+                f"API URL: {YOUDAO_API_URL}"
+            ), inline=False)
+        elif TRANSLATION_API == "azure":
+            embed.add_field(name="Azure翻译设置", value=(
+                f"密钥: `{AZURE_KEY[:4]}...` (隐藏)\n"
+                f"区域: {AZURE_REGION}"
+            ), inline=False)
+        elif TRANSLATION_API == "openai":
+            embed.add_field(name="OpenAI设置", value=(
+                f"API密钥: `{OPENAI_API_KEY[:4]}...` (隐藏)\n"
+                f"API基础URL: {OPENAI_API_BASE}\n"
+                f"模型名称: {OPENAI_MODEL_NAME}"
+            ), inline=False)
+        elif TRANSLATION_API == "google":
+            embed.add_field(name="Google AI设置", value=(
+                f"API密钥: `{GOOGLE_AI_API_KEY[:4]}...` (隐藏)\n"
+                f"模型名称: {GOOGLE_AI_MODEL_NAME}"
+            ), inline=False)
+        
+        # 添加缓存信息
+        embed.add_field(name="翻译缓存", value=f"已缓存 {len(translation_cache)} 条翻译", inline=False)
+        
+        # 添加命令使用说明
+        embed.add_field(name="命令用法", value=(
+            "更改翻译API: `/translationconfig action:更改翻译API api:选择API`\n"
+            "启用/禁用翻译: `/translationconfig action:启用/禁用翻译 status:启用或禁用`\n"
+            "更新API密钥: `/translationconfig action:更新API密钥设置 api:选择API [相关参数]`\n"
+            "清除缓存: `/translationconfig action:清除翻译缓存`"
+        ), inline=False)
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        
+    elif action == "change_api":
+        if not api:
+            await interaction.response.send_message("❌ 请指定要使用的翻译API。", ephemeral=True)
+            return
+            
+        old_api = TRANSLATION_API
+        TRANSLATION_API = api
+        
+        # 清除翻译缓存
+        translation_cache.clear()
+        
+        # 检查新API的配置是否完整
+        config_warning = ""
+        if api == "baidu":
+            if not BAIDU_APPID or not BAIDU_KEY:
+                config_warning = "\n⚠️ 百度翻译API配置不完整，请使用命令更新密钥设置。"
+        elif api == "youdao":
+            if not YOUDAO_APPID or not YOUDAO_APPKEY:
+                config_warning = "\n⚠️ 有道翻译API配置不完整，请使用命令更新密钥设置。"
+        elif api == "azure":
+            if not AZURE_KEY or not AZURE_REGION:
+                config_warning = "\n⚠️ Azure翻译API配置不完整，请使用命令更新密钥设置。"
+        elif api == "openai":
+            if not OPENAI_API_KEY:
+                config_warning = "\n⚠️ OpenAI API配置不完整，请使用命令更新密钥设置。"
+        elif api == "google":
+            if not GOOGLE_AI_API_KEY:
+                config_warning = "\n⚠️ Google AI API配置不完整，请使用命令更新密钥设置。"
+        
+        await interaction.response.send_message(
+            f"✅ 翻译API已从 {old_api} 更改为 {api}。翻译缓存已清除。{config_warning}",
+            ephemeral=True
+        )
+        
+    elif action == "toggle":
+        if not status:
+            await interaction.response.send_message("❌ 请指定是启用还是禁用翻译功能。", ephemeral=True)
+            return
+            
+        old_status = "启用" if ENABLE_TRANSLATION else "禁用"
+        
+        if status == "enable":
+            ENABLE_TRANSLATION = True
+            new_status = "启用"
+        else:
+            ENABLE_TRANSLATION = False
+            new_status = "禁用"
+            
+        await interaction.response.send_message(
+            f"✅ 翻译功能已从{old_status}变为{new_status}。",
+            ephemeral=True
+        )
+        
+    elif action == "update_keys":
+        if not api:
+            await interaction.response.send_message("❌ 请指定要更新的翻译API类型。", ephemeral=True)
+            return
+            
+        # 根据API类型更新相应的密钥设置
+        message = f"正在更新 {api} 的API设置...\n"
+        
+        if api == "baidu":
+            if app_id:
+                BAIDU_APPID = app_id
+                message += "• 已更新BAIDU_APPID\n"
+            if api_key:
+                BAIDU_KEY = api_key
+                message += "• 已更新BAIDU_KEY\n"
+            if not app_id and not api_key:
+                message += "⚠️ 未提供新的AppID或密钥，设置未变更\n"
+        
+        elif api == "youdao":
+            if app_id:
+                YOUDAO_APPID = app_id
+                message += "• 已更新YOUDAO_APPID\n"
+            if app_key:
+                YOUDAO_APPKEY = app_key
+                message += "• 已更新YOUDAO_APPKEY\n"
+            if not app_id and not app_key:
+                message += "⚠️ 未提供新的应用ID或密钥，设置未变更\n"
+        
+        elif api == "azure":
+            if api_key:
+                AZURE_KEY = api_key
+                message += "• 已更新AZURE_KEY\n"
+            if region:
+                AZURE_REGION = region
+                message += "• 已更新AZURE_REGION\n"
+            if not api_key and not region:
+                message += "⚠️ 未提供新的密钥或区域，设置未变更\n"
+        
+        elif api == "openai":
+            if api_key:
+                OPENAI_API_KEY = api_key
+                message += "• 已更新OPENAI_API_KEY\n"
+            if api_base:
+                OPENAI_API_BASE = api_base
+                message += "• 已更新OPENAI_API_BASE\n"
+            if model_name:
+                OPENAI_MODEL_NAME = model_name
+                message += "• 已更新OPENAI_MODEL_NAME\n"
+            if not api_key and not api_base and not model_name:
+                message += "⚠️ 未提供新的设置，配置未变更\n"
+        
+        elif api == "google":
+            if api_key:
+                GOOGLE_AI_API_KEY = api_key
+                message += "• 已更新GOOGLE_AI_API_KEY\n"
+            if model_name:
+                GOOGLE_AI_MODEL_NAME = model_name
+                message += "• 已更新GOOGLE_AI_MODEL_NAME\n"
+            if not api_key and not model_name:
+                message += "⚠️ 未提供新的设置，配置未变更\n"
+                
+        else:
+            await interaction.response.send_message(f"❌ 未知的API类型: {api}", ephemeral=True)
+            return
+            
+        # 清除翻译缓存
+        cache_size = len(translation_cache)
+        translation_cache.clear()
+        message += f"• 已清除 {cache_size} 条翻译缓存\n"
+        
+        # 如果更新的是当前正在使用的API，检查配置是否完整
+        if api == TRANSLATION_API:
+            config_complete = True
+            if api == "baidu" and (not BAIDU_APPID or not BAIDU_KEY):
+                config_complete = False
+            elif api == "youdao" and (not YOUDAO_APPID or not YOUDAO_APPKEY):
+                config_complete = False
+            elif api == "azure" and (not AZURE_KEY or not AZURE_REGION):
+                config_complete = False
+            elif api == "openai" and not OPENAI_API_KEY:
+                config_complete = False
+            elif api == "google" and not GOOGLE_AI_API_KEY:
+                config_complete = False
+                
+            if not config_complete:
+                message += "⚠️ 当前API配置仍不完整，翻译功能可能无法正常工作\n"
+            else:
+                message += "✅ 当前API配置已完整，翻译功能应正常工作\n"
+        
+        await interaction.response.send_message(message, ephemeral=True)
+        
+    elif action == "clear_cache":
+        cache_size = len(translation_cache)
+        translation_cache.clear()
+        
+        await interaction.response.send_message(
+            f"✅ 已清除 {cache_size} 条翻译缓存。",
+            ephemeral=True
+        )
+
+@tree.command(name="translatetest", description="测试翻译功能")
+@app_commands.describe(
+    text="要翻译的文本"
+)
+async def translatetest_command(interaction: discord.Interaction, text: str):
+    await interaction.response.defer(thinking=True)
+    
+    if not ENABLE_TRANSLATION:
+        await interaction.followup.send("❌ 翻译功能当前已禁用。请使用`/translationconfig toggle enable`启用。", ephemeral=True)
+        return
+    
+    # 检查是否包含中文
+    is_chinese_text = await is_chinese(text)
+    if not is_chinese_text:
+        await interaction.followup.send("⚠️ 输入的文本不包含中文，不需要翻译。", ephemeral=True)
+        return
+    
+    # 执行翻译
+    translated, was_translated, error = await translate_text_if_chinese(text)
+    
+    if error:
+        await interaction.followup.send(f"❌ 翻译失败: {error}", ephemeral=True)
+        return
+    
+    if not was_translated:
+        await interaction.followup.send("⚠️ 文本未被翻译，请检查翻译设置。", ephemeral=True)
+        return
+    
+    # 创建嵌入消息
+    embed = discord.Embed(
+        title="翻译测试",
+        color=0x3498db
+    )
+    
+    embed.add_field(name="原始文本", value=text, inline=False)
+    embed.add_field(name="翻译结果", value=translated, inline=False)
+    embed.add_field(name="使用的API", value=TRANSLATION_API, inline=True)
+    embed.add_field(name="缓存状态", value="从缓存获取" if text in translation_cache else "新翻译", inline=True)
+    
+    await interaction.followup.send(embed=embed)
+                                           
 # ===== 预览批量生成 =====
 @tree.command(name="previewbatch", description="预览批量生成的组合而不实际生成图像")
 @app_commands.describe(
