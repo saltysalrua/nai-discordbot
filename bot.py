@@ -38,7 +38,7 @@ user_batch_limits = {}  # 记录用户每日批量生成数量
 
 # 记录机器人启动时间和版本
 BOT_START_TIME = datetime.datetime.now()
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 # ===== 配置管理 =====
 def read_config_file(file_path="config.txt"):
@@ -119,15 +119,17 @@ NAI_API_URL = "https://image.novelai.net/ai/generate-image"
 
 # 可用的选项
 AVAILABLE_MODELS = [
+    "nai-diffusion-4-5-curated",
     "nai-diffusion-4-full",
-    "nai-diffusion-4-curated",
+    "nai-diffusion-4-curated-preview",
     "nai-diffusion-3",
     "nai-diffusion-3-furry"
 ]
 
 MODEL_DESCRIPTIONS = {
+    "nai-diffusion-4-5-curated": "最新精选模型",
     "nai-diffusion-4-full": "最新完整模型",
-    "nai-diffusion-4-curated": "V4精选版",
+    "nai-diffusion-4-curated-preview": "V4精选版",
     "nai-diffusion-3": "V3模型 (推荐，更稳定)",
     "nai-diffusion-3-furry": "毛绒特定模型"
 }
