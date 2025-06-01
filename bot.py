@@ -119,6 +119,7 @@ NAI_API_URL = "https://image.novelai.net/ai/generate-image"
 
 # 可用的选项
 AVAILABLE_MODELS = [
+    "nai-diffusion-4-5-full",
     "nai-diffusion-4-5-curated",
     "nai-diffusion-4-full",
     "nai-diffusion-4-curated-preview",
@@ -127,6 +128,7 @@ AVAILABLE_MODELS = [
 ]
 
 MODEL_DESCRIPTIONS = {
+    "nai-diffusion-4-5-full": "最新最热模型",
     "nai-diffusion-4-5-curated": "最新精选模型",
     "nai-diffusion-4-full": "最新完整模型",
     "nai-diffusion-4-curated-preview": "V4精选版",
